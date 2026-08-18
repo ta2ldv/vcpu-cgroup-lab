@@ -416,9 +416,264 @@ The Kubernetes translation of Act A is a production classic: give a multi-thread
 
 ---
 
-# Part 3 — Rust load generator *(coming soon)*
+# Part 3 — Rust load generator *(in progress)*
 
-A self-measuring load generator: N threads, each counting work done per second. Planned experiments: thread-count sweep vs 2 vCPUs (the parallelism wall), the same sweep inside a throttled cgroup, and `std::thread::available_parallelism()` vs reality.
+> **Test machine reminder** (details in [§1.7](#17-reading-a-real-machine-t3large)): AWS EC2 `t3.large` — **1 physical core × 2 SMT threads = 2 vCPUs**, Intel Xeon 8259CL @ 2.50 GHz, Ubuntu, cgroup v2. Every number in this part is relative to those 2 vCPUs.
+
+A self-measuring load generator: N threads, each counting work done per second. This part has three goals, each an experiment: the thread-count sweep vs 2 vCPUs (§3.4 — where the **concurrency vs parallelism** distinction gets measured, not just defined), the same sweep inside a throttled cgroup (the thread × quota matrix), and `std::thread::available_parallelism()` vs reality.
+
+## 3.1 Setting up the Rust toolchain on the VM
+
+Install via **rustup** (the Rust project's official installer), not the distro package — `apt install cargo` ships a version that is typically a year or more behind, while rustup gives current stable and easy updates (`rustup update`).
+
+```bash
+# Install (as the regular user, no sudo needed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# Load the environment into the current shell (new logins get it automatically)
+. "$HOME/.cargo/env"
+
+# Verify
+cargo --version
+```
+
+Everything lands under `~/.cargo` and `~/.rustup` — no system files touched, removable with `rustup self uninstall`.
+
+rustup may warn: `no default linker ('cc') was found in your PATH`. Rust compiles your code itself, but the final step — linking the binary — uses the system's C toolchain, which minimal cloud images don't ship. Install it, then smoke-test the toolchain end to end:
+
+```bash
+sudo NEEDRESTART_MODE=a apt update && sudo NEEDRESTART_MODE=a apt install -y build-essential
+```
+
+(`NEEDRESTART_MODE=a`: Ubuntu server ships the `needrestart` tool, which pops an interactive "which services should be restarted?" dialog after library upgrades; `a` = restart what's needed automatically, no questions.)
+
+```bash
+cargo new hello && cd hello && cargo run   # prints "Hello, world!" ⇒ toolchain complete
+```
+
+**Repo layout note:** the burner programs in this lab are single-file, std-only examples under [`burners/`](burners/), compiled directly with `rustc -O` — cargo would add nothing yet (no dependencies). Cargo returns the day we need crates (e.g. async experiments). The one risk of the cargo-less path: **`-O` is your responsibility now** — `rustc` does *not* optimize by default, and unoptimized benchmark numbers are garbage.
+
+Don't confuse the two flags that appear side by side (and `-0`, digit zero, is not a flag at all):
+
+```bash
+rustc -O burners/02_threads.rs -o burn
+#      ↑ capital O: Optimize        ↑ lowercase o: output — names the binary
+```
+
+## 3.2 First measurement — a self-measuring, single-thread burner
+
+In Part 2 the referee was `top`, which shows CPU *occupancy*. From here on the program measures itself and reports *actual work done* — because under throttling, occupancy says "50 %" while only the work rate tells you what that costs. The code lives in this repo at [`burners/01_baseline.rs`](burners/01_baseline.rs):
+
+```rust
+use std::time::{Duration, Instant};
+
+fn main() {
+    let secs = 5;
+    let start = Instant::now();
+    let mut count: u64 = 0;
+
+    while start.elapsed() < Duration::from_secs(secs) {
+        count += 1;
+    }
+
+    let rate = count as f64 / secs as f64 / 1_000_000.0;
+    println!("{count} iterations in {secs} s  ->  {rate:.1} M iter/s");
+}
+```
+
+Line by line:
+
+| Code | What it does |
+|---|---|
+| `Instant::now()` | Starts the stopwatch. A *monotonic* clock — immune to wall-clock changes (NTP, DST). |
+| `start.elapsed() < Duration::from_secs(secs)` | "Loop until 5 s have passed." The clock read is cheap — no syscall; it goes through the vDSO, in user space. |
+| `count += 1` | The "work": increment a `u64` as fast as possible. |
+| `count as f64 / secs / 1e6` | Normalizes to **M iter/s** — the common unit for every experiment that follows. |
+
+Compile and run it both ways (binaries go to the git-ignored `burners/bin/`):
+
+```bash
+mkdir -p burners/bin
+rustc    burners/01_baseline.rs -o burners/bin/01_baseline && ./burners/bin/01_baseline   # unoptimized
+rustc -O burners/01_baseline.rs -o burners/bin/01_baseline && ./burners/bin/01_baseline   # optimized
+```
+
+Real output (t3.large):
+
+```
+131746254 iterations in 5 s  ->  26.3 M iter/s        ← unoptimized
+169633279 iterations in 5 s  ->  33.9 M iter/s        ← optimized (-O)
+```
+
+**Measurement lesson #1.** Release is only ~29 % faster here — yet on pure compute loops it is routinely 10–100×. The explanation: every iteration calls `start.elapsed()`, so the loop's dominant cost is the clock read, which the optimizer cannot remove. As written, this program is closer to a "clock reads per second" benchmark than an "additions per second" one. You always measure *the most expensive thing in the loop* — know what that is. The next revision fixes this by checking the clock every N iterations instead of every one. The standing rule survives either way: **benchmark numbers only count from optimized builds (`rustc -O`).**
+
+## 3.3 Version 2 — clean measurement, N threads
+
+The revised burner is [`burners/02_threads.rs`](burners/02_threads.rs). Changes vs 01: the clock is checked once per 1 M iterations (the loop cost is now genuinely the counting), `std::hint::black_box` stops the optimizer from collapsing the count loop into a single addition, and the thread count comes as a CLI argument. The full code, annotated for a Rust newcomer:
+
+```rust
+use std::env;
+use std::time::{Duration, Instant};
+
+const BATCH: u64 = 1_000_000;            // how many counts between two clock reads
+
+// The work of ONE thread: count for `secs` seconds, return the total.
+fn burn(secs: u64) -> u64 {
+    let start = Instant::now();
+    let mut count: u64 = 0;
+    while start.elapsed() < Duration::from_secs(secs) {   // clock read: once per BATCH
+        for _ in 0..BATCH {
+            // black_box = "compiler, you MUST really compute this".
+            // Without it, -O would collapse the whole loop into `count += BATCH`
+            // and we would measure nothing.
+            count = std::hint::black_box(count + 1);
+        }
+    }
+    count
+}
+
+fn main() {
+    let secs = 5;
+
+    // First CLI argument = thread count. `nth(1)` skips the program name;
+    // if the argument is missing or not a number, fall back to 1.
+    let threads: usize = env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(1);
+
+    let start = Instant::now();
+
+    // Start N identical threads. `move` hands each closure its own copy of `secs`.
+    // Each `spawn` returns a JoinHandle — a ticket to collect that thread's result.
+    let handles: Vec<_> = (0..threads).map(|_| std::thread::spawn(move || burn(secs))).collect();
+
+    // `join()` blocks until the thread finishes and yields its return value.
+    // Summing all tickets gives the total work done by all threads.
+    let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+    let wall = start.elapsed().as_secs_f64();   // wall-clock time actually elapsed
+
+    let rate = total as f64 / wall / 1_000_000.0;
+    println!("{threads} thread(s): {total} iters in {wall:.2} s  ->  {rate:.0} M iter/s total");
+}
+```
+
+Execution model in one sentence: `main` spawns N workers that each count independently for 5 seconds (no shared data, no locks), then waits at the `join` line like a finish line, sums the per-thread totals, and divides by the *wall-clock* time — so the printed rate is machine throughput, not per-thread speed.
+
+```bash
+mkdir -p burners/bin
+rustc -O burners/02_threads.rs -o burners/bin/02_threads
+```
+
+```bash
+./burners/bin/02_threads 1     # 1 thread; the argument is the thread count (default 1)
+```
+
+Real output (t3.large), version 1 vs version 2, same machine, same "work":
+
+```
+$ ./burners/bin/01_baseline
+172688794 iterations in 5 s   ->   34.5 M iter/s          ← v1: clock read every iteration
+$ ./burners/bin/02_threads 1
+1 thread(s): 2885000000 iters in 5.00 s  ->  577 M iter/s ← v2: clock read every 1 M iterations
+```
+
+**Measurement lesson #1, closed.** 17× difference — not because the machine got faster, but because v1 was effectively benchmarking clock reads, and v2 benchmarks the actual counting. (Sanity check: 577 M add/s on a 2.5 GHz core ≈ 4 cycles per iteration, plausible with the memory traffic `black_box` forces.) Fix the measurement before trusting the number. *(Thread sweep results: next.)*
+
+## 3.4 Thread sweep — the parallelism wall, measured
+
+One binary, one variable: the thread count. Plus one special run — 2 threads pinned to a single CPU — which separates concurrency from parallelism *with the thread count held constant*.
+
+### Which number is the reference?
+
+Two programs have appeared so far, and they play different roles:
+
+- **`01_baseline.rs` is a teaching demo, not a reference.** Its job was to expose the *clock problem*: it read the clock on every iteration, and since a clock read costs ~17× more than the counting itself, its number (34.5 M iter/s) measured clock reads, not work (§3.2).
+- **`./burn 1` (i.e. `02_threads.rs` with 1 thread) is the reference.** With the clock problem fixed (one clock read per million iterations), one thread on one vCPU produces **578 M iter/s** — "what one vCPU is worth." **Every comparison below is against this number**, never against 01.
+
+### The tool: `taskset`
+
+`taskset` sets a process's **CPU affinity**: the set of logical CPUs the kernel scheduler is allowed to place it on. `taskset -c 0 <cmd>` launches `<cmd>` allowed on CPU 0 only — the process's threads all inherit the restriction, so two busy threads have no choice but to take turns on one vCPU.
+
+```bash
+taskset -c 0 ./burn 2     # launch pinned to CPU 0 only
+taskset -c 0,1 <cmd>      # launch allowed on CPUs 0 and 1 (ranges work too: -c 0-3)
+taskset -cp <pid>         # show a running process's current affinity
+taskset -cp 0 <pid>       # re-pin a running process to CPU 0, live
+```
+
+Why we need it here: without it, the scheduler immediately spreads 2 busy threads across our 2 vCPUs, and concurrency and parallelism rise together — indistinguishable. Pinning removes the parallelism while keeping the concurrency, which is exactly the variable we want to isolate. What the scheduler does in each case, on a timeline:
+
+```
+./burn 2  (both CPUs allowed)              taskset -c 0 ./burn 2  (CPU 0 only)
+CPU 0: AAAAAAAAAAAAAAAA                    CPU 0: AAAA BBBB AAAA BBBB ...
+CPU 1: BBBBBBBBBBBBBBBB                    CPU 1: (idle)
+→ A and B truly simultaneous              → A and B take turns; at any instant
+  (parallelism = 2)                          only one runs (parallelism = 1)
+```
+
+Both cases have concurrency = 2 (two threads in flight). Only the left one has parallelism = 2 — and only the left one is faster.
+
+Relation to Part 2's `cpuset.cpus` — same kernel capability, two interfaces:
+
+| | `taskset` | cgroup `cpuset.cpus` |
+|---|---|---|
+| Scope | one process (+ its threads/children) | every process in the cgroup |
+| Privileges | none needed (own processes) | root (cgroup filesystem writes) |
+| Enforcement | advisory — the process itself may call `sched_setaffinity()` and escape | mandatory — the cgroup wall cannot be escaped from inside |
+| Typical use | quick experiments, benchmarks | containers, Kubernetes static CPU manager |
+
+```bash
+rustc -O burners/02_threads.rs -o burn
+./burn 1
+./burn 2
+taskset -c 0 ./burn 2
+./burn 4
+./burn 8
+```
+
+Real output (t3.large — 2 vCPUs = 2 SMT threads of **one** physical core):
+
+```
+1 thread(s): 2889000000 iters in 5.00 s  ->  578 M iter/s total
+2 thread(s): 4777000000 iters in 5.00 s  ->  955 M iter/s total
+2 thread(s): 2886000000 iters in 5.00 s  ->  577 M iter/s total   ← taskset -c 0
+4 thread(s): 4648000000 iters in 5.00 s  ->  929 M iter/s total
+8 thread(s): 4249000000 iters in 5.01 s  ->  848 M iter/s total
+```
+
+| Run | Concurrency | Parallelism | M iter/s | vs `./burn 1` |
+|---|---|---|---|---|
+| `./burn 1` | 1 | 1 | 578 | **1.00× (reference)** |
+| `./burn 2` | 2 | 2 | **955** | **1.65×** — not 2×! |
+| `taskset -c 0 ./burn 2` | 2 | **1** | **577** | **1.00×** |
+| `./burn 4` | 4 | 2 | 929 | 1.61× |
+| `./burn 8` | 8 | 2 | 848 | 1.47× |
+
+### Run by run
+
+**`./burn 1` — the reference.** One thread, one vCPU busy, one idle. Purpose: establish the unit "what one vCPU is worth" (578 M iter/s). Every other row is judged against this number.
+
+**`./burn 2` — full parallelism.** Two threads, two vCPUs, no restrictions — the machine's best case. Naive expectation: 2× = 1156. Measured: **955 = 1.65×**. The missing 35 % is SMT: these two vCPUs are the two order boards of *one* kitchen (§1.2); the threads share the core's execution units. The SMT bonus is workload-dependent (rule of thumb +20–30 %; this add-loop got +65 %), but it is never +100 %. **"2 vCPUs" ≠ "2 cores" — here is the measurement.**
+
+**`taskset -c 0 ./burn 2` — concurrency without parallelism.** The control experiment: same two threads, but confined to CPU 0, so they *take turns* instead of running simultaneously. Concurrency is 2; parallelism is 1. Measured: **577 ≈ the 1-thread baseline exactly**. Doubling concurrency moved the work rate by nothing. **Parallelism gives speed; concurrency only gives structure** (useful for overlapping waits — but there is nothing to wait for in a pure compute loop).
+
+**`./burn 4` and `./burn 8` — past the wall.** More threads than the hardware can run at once: parallelism stays pinned at 2 while concurrency grows. Expectation: flat at ~955. Measured: **929 and 848 — flat, then sagging** (~11 % below the peak at 8 threads).
+
+Where does the loss come from? Follow the mechanics:
+
+1. **8 runnable threads ÷ 2 logical CPUs = ~4 threads queued per CPU.** Everyone wants to run all the time; the hardware can seat two.
+2. **The scheduler enforces fairness by rotation.** Linux's scheduler (CFS, and EEVDF in newer kernels) gives each thread a short time slice, then swaps: lift A off the CPU, seat B, a few milliseconds later lift B, seat C… Every thread advances, none quickly.
+3. **Each swap — a *context switch* — has two costs.** The **direct** cost is small and visible: save A's registers, load B's, run the scheduler's bookkeeping — on the order of microseconds. The **indirect** cost is the sneaky one: while A was running, the CPU's L1/L2 caches filled with *A's* data. B arrives to a cold cache and stalls on memory until it re-warms — cycles that produce no work, and they don't appear in any "context switch time" statistic.
+4. **The friction analogy.** The mass being pushed (total work) is unchanged; only the number of contact points (switches) grew — and every contact converts a little energy into heat. 955 → 848 is that heat: an **11 % friction loss**.
+
+**Beyond the wall, threads don't just stop helping — they start costing.**
+
+A subtlety that makes our −11 % a *best case*: these iterations are fully independent — no shared data, no locks, a tiny working set. Real applications share state; their threads evict each other's cache lines and queue on locks, so the oversubscription friction is typically far heavier than this clean loop shows.
+
+### The lessons
+
+1. **SMT inflates the CPU count**: capacity planning that reads `nproc` and assumes "N vCPUs = N cores of work" over-promises by design.
+2. **Thread count is a statement about structure, not speed**; speed is capped by available parallel hardware.
+3. **Oversubscription has a price** — and in Part 3's cgroup experiments this price will grow teeth: 8 threads against a capped quota burn the budget 8× faster, then freeze together.
 
 # Part 4 — Kubernetes requests & limits *(coming soon)*
 

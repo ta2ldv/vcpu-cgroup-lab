@@ -1,0 +1,14 @@
+# Rust / Cargo
+**/target
+burn
+
+# compiled burner binaries (keep the .rs sources)
+burners/bin/
+
+# macOS
+.DS_Store
+
+# editor
+.idea/
+.vscode/
+*.swp
