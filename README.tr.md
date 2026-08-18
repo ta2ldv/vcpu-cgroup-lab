@@ -31,9 +31,10 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [2.8 Bölüm 2'nin özeti](#28-bölüm-2nin-özeti)
 - [Bölüm 3 — Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci-devam-ediyor)
   - [3.1 VM'de Rust toolchain kurulumu](#31-vmde-rust-toolchain-kurulumu)
-  - [3.2 İlk ölçüm — kendi kendini ölçen tek thread'lik yakıcı](#32-i̇lk-ölçüm--kendi-kendini-ölçen-tek-threadlik-yakıcı)
-  - [3.3 Sürüm 2 — temiz ölçüm, N thread](#33-sürüm-2--temiz-ölçüm-n-thread)
-  - [3.4 Thread taraması — parallelism duvarı, ölçülmüş](#34-thread-taraması--parallelism-duvarı-ölçülmüş)
+  - [Deney 3.2 — ilk ölçüm: saat sorunu](#deney-32--ilk-ölçüm-saat-sorunu)
+  - [Deney 3.3 — temiz ölçüm, N thread](#deney-33--temiz-ölçüm-n-thread)
+  - [Deney 3.4 — thread taraması: parallelism duvarı](#deney-34--thread-taraması-parallelism-duvarı)
+  - [Deney 3.5 — thread × quota matrisi](#deney-35--thread--quota-matrisi)
 - [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-yakında)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 
@@ -488,7 +489,7 @@ rustc -O burners/02_threads.rs -o burners/bin/02_threads
 #      ↑ büyük O: Optimize          ↑ küçük o: output — binary'nin adını verir
 ```
 
-## 3.2 İlk ölçüm — kendi kendini ölçen tek thread'lik yakıcı
+## Deney 3.2 — ilk ölçüm: saat sorunu
 
 Bölüm 2'de hakem `top`'tu; o CPU *doluluğunu* gösterir. Bundan sonra programın kendisi ölçüp *gerçek iş çıktısını* raporlayacak — çünkü throttling altında doluluk "%50" der, ama bunun neye mal olduğunu yalnızca iş hızı söyler. Kod bu repo'da: [`burners/01_baseline.rs`](burners/01_baseline.rs):
 
@@ -535,7 +536,7 @@ Gerçek çıktı (t3.large):
 
 **Ölçüm dersi #1.** Release burada yalnızca ~%29 hızlı — oysa saf hesap döngülerinde fark rutin olarak 10–100× olur. Açıklaması: her iterasyon `start.elapsed()` çağırıyor; döngünün baskın maliyeti optimizer'ın kaldıramayacağı saat okuması. Bu haliyle program "saniyede toplama" değil, "saniyede saat okuması" benchmark'ına daha yakın. Her zaman *döngüdeki en pahalı şeyi* ölçersin — onun ne olduğunu bil. Sonraki sürüm bunu, saate her turda değil her N turda bir bakarak düzeltecek. Kalıcı kural her durumda geçerli: **benchmark sayısı yalnızca optimize build'den (`rustc -O`) sayılır.**
 
-## 3.3 Sürüm 2 — temiz ölçüm, N thread
+## Deney 3.3 — temiz ölçüm, N thread
 
 Yenilenmiş burner: [`burners/02_threads.rs`](burners/02_threads.rs). 01'e göre farklar: saate her turda değil 1 M iterasyonda bir bakılıyor (döngünün maliyeti artık gerçekten sayma), `std::hint::black_box` optimizer'ın sayma döngüsünü tek toplamaya indirgemesini engelliyor, thread sayısı CLI argümanı olarak geliyor. Kodun tamamı, Rust'a yeni başlayan için açıklamalı:
 
@@ -606,7 +607,7 @@ $ ./burners/bin/02_threads 1
 
 **Ölçüm dersi #1, kapandı.** 17× fark — makine hızlandığı için değil: v1 fiilen saat okumayı benchmark'lıyordu, v2 gerçek saymayı ölçüyor. (Sağlama: 2.5 GHz core'da 577 M toplama/s ≈ iterasyon başına ~4 cycle; `black_box`'ın zorladığı bellek trafiğiyle makul.) Sayıya güvenmeden önce ölçümü düzelt. *(Thread taraması sonuçları: sırada.)*
 
-## 3.4 Thread taraması — parallelism duvarı, ölçülmüş
+## Deney 3.4 — thread taraması: parallelism duvarı
 
 Tek binary, tek değişken: thread sayısı. Artı bir özel koşu — tek CPU'ya kilitlenmiş 2 thread — *thread sayısı sabitken* concurrency ile parallelism'i birbirinden ayıran koşu.
 
@@ -703,7 +704,7 @@ Kayıp nereden geliyor? Mekaniği takip et:
 2. **Thread sayısı hız değil yapı beyanıdır**; hızın tavanını eldeki paralel donanım çizer.
 3. **Oversubscription'ın bedeli vardır** — ve Part 3'ün cgroup deneylerinde bu bedelin dişleri çıkacak: kısıtlı quota'ya karşı 8 thread bütçeyi 8× hızlı yakar, sonra hep birlikte donar.
 
-## 3.5 Thread × quota matrisi
+## Deney 3.5 — thread × quota matrisi
 
 Bölüm 2'de oyuncak bir döngüyü kısıp `top`'a bakmıştık; şimdi *ölçüm aletinin kendisini* kısıp gerçek sayılar okuyoruz. İki değişken, tek ızgara: thread sayısı (1 / 2 / 8) × `cpu.max` (limitsiz / 1 vCPU / 0.5 vCPU) — dokuz hücre.
 
@@ -743,6 +744,61 @@ sudo rmdir /sys/fs/cgroup/lab
 
 ### Sonuçlar
 
+Tam koşu (t3.large), dokuz hücrenin tamamı, her koşudan sonra şahit okumasıyla:
+
+```
+$ echo "max 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max        # ── kolon 1: limitsiz
+$ burners/bin/02_threads 1
+1 thread(s): 2906000000 iters in 5.00 s  ->  581 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 324
+nr_throttled 249
+$ burners/bin/02_threads 2
+2 thread(s): 4289000000 iters in 5.00 s  ->  858 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 324
+nr_throttled 249
+$ burners/bin/02_threads 8
+8 thread(s): 4280000000 iters in 5.01 s  ->  854 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 324
+nr_throttled 249
+
+$ echo "100000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max     # ── kolon 2: 1 vCPU
+$ burners/bin/02_threads 1
+1 thread(s): 2872000000 iters in 5.00 s  ->  574 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 379
+nr_throttled 249
+$ burners/bin/02_threads 2
+2 thread(s): 2454000000 iters in 5.01 s  ->  489 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 433
+nr_throttled 296
+$ burners/bin/02_threads 8
+8 thread(s): 2457000000 iters in 5.01 s  ->  490 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 488
+nr_throttled 344
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # ── kolon 3: 0.5 vCPU
+$ burners/bin/02_threads 1
+1 thread(s): 1442000000 iters in 5.00 s  ->  288 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 548
+nr_throttled 394
+$ burners/bin/02_threads 2
+2 thread(s): 1207000000 iters in 5.01 s  ->  241 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 603
+nr_throttled 444
+$ burners/bin/02_threads 8
+8 thread(s): 1258000000 iters in 5.04 s  ->  250 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 660
+nr_throttled 495
+```
+
 Throughput (M iter/s):
 
 | | limitsiz | 1 vCPU | 0.5 vCPU |
@@ -751,6 +807,19 @@ Throughput (M iter/s):
 | **2 thread** | 858 | 489 | 241 |
 | **8 thread** | 854 | 490 | 250 |
 
+**Kernel şahidi deltaları nasıl hesaplanır.** `cpu.stat` sayaçları kümülatiftir — cgroup yaşadıkça asla sıfırlanmaz. Yani tek bir okuma *bu* koşu hakkında hiçbir şey söylemez; bir koşuya ait olan, **koşudan sonraki okuma ile öncesindeki okuma arasındaki farktır** (öncesi = bir önceki koşunun okuması). Yukarıdaki ham dökümden adım adım:
+
+| Koşu | önce (periods / throttled) | sonra | Δ`nr_periods` | Δ`nr_throttled` |
+|---|---|---|---|---|
+| 1 vCPU, 1 thread | 324 / 249 | 379 / 249 | 55 | **0** |
+| 1 vCPU, 2 thread | 379 / 249 | 433 / 296 | 54 | 47 |
+| 1 vCPU, 8 thread | 433 / 296 | 488 / 344 | 55 | 48 |
+| 0.5 vCPU, 1 thread | 488 / 344 | 548 / 394 | 60 | 50 |
+| 0.5 vCPU, 2 thread | 548 / 394 | 603 / 444 | 55 | 50 |
+| 0.5 vCPU, 8 thread | 603 / 444 | 660 / 495 | 57 | 51 |
+
+(Limitsiz kolon 324 / 249'da donuk kaldı — bunlar aynı cgroup'taki daha önceki denemelerin kalıntısı; limit yokken muhasebe hiç çalışmaz. Koşu başına ~55 pencere de tesadüf değil: 5 sn koşu ÷ 100 ms period ≈ 50 pencere + komutlar arası birkaç pencerelik shell hareketi.)
+
 Kernel şahidi (koşu başına Δ`nr_throttled` / Δ`nr_periods`):
 
 | | limitsiz | 1 vCPU | 0.5 vCPU |
@@ -758,6 +827,8 @@ Kernel şahidi (koşu başına Δ`nr_throttled` / Δ`nr_periods`):
 | **1 thread** | 0 / 0 | **0** / 55 | 50 / 60 |
 | **2 thread** | 0 / 0 | 47 / 54 | 50 / 55 |
 | **8 thread** | 0 / 0 | 48 / 55 | 51 / 57 |
+
+Hücre okuma örneği: "47 / 54" = bu koşu sırasında geçen 54 quota penceresinin 47'sinde grup donduruldu — pencerelerin %87'sinde throttle.
 
 *(Yan not: limitsiz kolonda `nr_periods` hiç ilerlemedi — bandwidth muhasebesi yalnız bir limit varken çalışır. Limitsiz 2-thread hücresi 858 ölçtü, §3.4'te 955'ti: t3'ün CPU credit'leri erimeye başlamıştı; `%st`'yi izle.)*
 

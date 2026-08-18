@@ -31,9 +31,10 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [2.8 Part 2 takeaways](#28-part-2-takeaways)
 - [Part 3 — Rust load generator](#part-3--rust-load-generator-in-progress)
   - [3.1 Setting up the Rust toolchain on the VM](#31-setting-up-the-rust-toolchain-on-the-vm)
-  - [3.2 First measurement — a self-measuring, single-thread burner](#32-first-measurement--a-self-measuring-single-thread-burner)
-  - [3.3 Version 2 — clean measurement, N threads](#33-version-2--clean-measurement-n-threads)
-  - [3.4 Thread sweep — the parallelism wall, measured](#34-thread-sweep--the-parallelism-wall-measured)
+  - [Experiment 3.2 — first measurement: the clock problem](#experiment-32--first-measurement-the-clock-problem)
+  - [Experiment 3.3 — clean measurement, N threads](#experiment-33--clean-measurement-n-threads)
+  - [Experiment 3.4 — thread sweep: the parallelism wall](#experiment-34--thread-sweep-the-parallelism-wall)
+  - [Experiment 3.5 — the thread × quota matrix](#experiment-35--the-thread--quota-matrix)
 - [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-coming-soon)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 
@@ -488,7 +489,7 @@ rustc -O burners/02_threads.rs -o burners/bin/02_threads
 #      ↑ capital O: Optimize        ↑ lowercase o: output — names the binary
 ```
 
-## 3.2 First measurement — a self-measuring, single-thread burner
+## Experiment 3.2 — first measurement: the clock problem
 
 In Part 2 the referee was `top`, which shows CPU *occupancy*. From here on the program measures itself and reports *actual work done* — because under throttling, occupancy says "50 %" while only the work rate tells you what that costs. The code lives in this repo at [`burners/01_baseline.rs`](burners/01_baseline.rs):
 
@@ -535,7 +536,7 @@ Real output (t3.large):
 
 **Measurement lesson #1.** Release is only ~29 % faster here — yet on pure compute loops it is routinely 10–100×. The explanation: every iteration calls `start.elapsed()`, so the loop's dominant cost is the clock read, which the optimizer cannot remove. As written, this program is closer to a "clock reads per second" benchmark than an "additions per second" one. You always measure *the most expensive thing in the loop* — know what that is. The next revision fixes this by checking the clock every N iterations instead of every one. The standing rule survives either way: **benchmark numbers only count from optimized builds (`rustc -O`).**
 
-## 3.3 Version 2 — clean measurement, N threads
+## Experiment 3.3 — clean measurement, N threads
 
 The revised burner is [`burners/02_threads.rs`](burners/02_threads.rs). Changes vs 01: the clock is checked once per 1 M iterations (the loop cost is now genuinely the counting), `std::hint::black_box` stops the optimizer from collapsing the count loop into a single addition, and the thread count comes as a CLI argument. The full code, annotated for a Rust newcomer:
 
@@ -606,7 +607,7 @@ $ ./burners/bin/02_threads 1
 
 **Measurement lesson #1, closed.** 17× difference — not because the machine got faster, but because v1 was effectively benchmarking clock reads, and v2 benchmarks the actual counting. (Sanity check: 577 M add/s on a 2.5 GHz core ≈ 4 cycles per iteration, plausible with the memory traffic `black_box` forces.) Fix the measurement before trusting the number. *(Thread sweep results: next.)*
 
-## 3.4 Thread sweep — the parallelism wall, measured
+## Experiment 3.4 — thread sweep: the parallelism wall
 
 One binary, one variable: the thread count. Plus one special run — 2 threads pinned to a single CPU — which separates concurrency from parallelism *with the thread count held constant*.
 
@@ -703,7 +704,7 @@ A subtlety that makes our −11 % a *best case*: these iterations are fully inde
 2. **Thread count is a statement about structure, not speed**; speed is capped by available parallel hardware.
 3. **Oversubscription has a price** — and in Part 3's cgroup experiments this price will grow teeth: 8 threads against a capped quota burn the budget 8× faster, then freeze together.
 
-## 3.5 The thread × quota matrix
+## Experiment 3.5 — the thread × quota matrix
 
 Part 2 throttled a toy loop and watched `top`; now we throttle the *measuring instrument* and read real numbers. Two variables, one grid: thread count (1 / 2 / 8) × `cpu.max` (unlimited / 1 vCPU / 0.5 vCPU) — nine cells.
 
@@ -743,6 +744,61 @@ Why read `cpu.stat` after every run, not once per column? The counters are **cum
 
 ### Results
 
+The full run (t3.large), all nine cells with the witness read after every run:
+
+```
+$ echo "max 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max        # ── column 1: unlimited
+$ burners/bin/02_threads 1
+1 thread(s): 2906000000 iters in 5.00 s  ->  581 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 324
+nr_throttled 249
+$ burners/bin/02_threads 2
+2 thread(s): 4289000000 iters in 5.00 s  ->  858 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 324
+nr_throttled 249
+$ burners/bin/02_threads 8
+8 thread(s): 4280000000 iters in 5.01 s  ->  854 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 324
+nr_throttled 249
+
+$ echo "100000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max     # ── column 2: 1 vCPU
+$ burners/bin/02_threads 1
+1 thread(s): 2872000000 iters in 5.00 s  ->  574 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 379
+nr_throttled 249
+$ burners/bin/02_threads 2
+2 thread(s): 2454000000 iters in 5.01 s  ->  489 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 433
+nr_throttled 296
+$ burners/bin/02_threads 8
+8 thread(s): 2457000000 iters in 5.01 s  ->  490 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 488
+nr_throttled 344
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # ── column 3: 0.5 vCPU
+$ burners/bin/02_threads 1
+1 thread(s): 1442000000 iters in 5.00 s  ->  288 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 548
+nr_throttled 394
+$ burners/bin/02_threads 2
+2 thread(s): 1207000000 iters in 5.01 s  ->  241 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 603
+nr_throttled 444
+$ burners/bin/02_threads 8
+8 thread(s): 1258000000 iters in 5.04 s  ->  250 M iter/s total
+$ grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+nr_periods 660
+nr_throttled 495
+```
+
 Throughput (M iter/s):
 
 | | unlimited | 1 vCPU | 0.5 vCPU |
@@ -751,6 +807,19 @@ Throughput (M iter/s):
 | **2 threads** | 858 | 489 | 241 |
 | **8 threads** | 854 | 490 | 250 |
 
+**Computing the kernel-witness deltas.** `cpu.stat` counters are cumulative — they never reset while the cgroup exists. So a single reading says nothing about *this* run; what belongs to a run is the **difference between the reading after it and the reading before it** (i.e. the previous run's reading). Worked through the raw transcript above:
+
+| Run | before (periods / throttled) | after | Δ`nr_periods` | Δ`nr_throttled` |
+|---|---|---|---|---|
+| 1 vCPU, 1 thread | 324 / 249 | 379 / 249 | 55 | **0** |
+| 1 vCPU, 2 threads | 379 / 249 | 433 / 296 | 54 | 47 |
+| 1 vCPU, 8 threads | 433 / 296 | 488 / 344 | 55 | 48 |
+| 0.5 vCPU, 1 thread | 488 / 344 | 548 / 394 | 60 | 50 |
+| 0.5 vCPU, 2 threads | 548 / 394 | 603 / 444 | 55 | 50 |
+| 0.5 vCPU, 8 threads | 603 / 444 | 660 / 495 | 57 | 51 |
+
+(The unlimited column stayed frozen at 324 / 249 — those are leftovers from earlier experiments in the same cgroup; with no limit set, accounting doesn't even run. And the ~55 periods per run is no accident: a 5 s run ÷ 100 ms period ≈ 50 windows, plus a few windows of shell activity between commands.)
+
 Kernel witness (per-run Δ`nr_throttled` / Δ`nr_periods`):
 
 | | unlimited | 1 vCPU | 0.5 vCPU |
@@ -758,6 +827,8 @@ Kernel witness (per-run Δ`nr_throttled` / Δ`nr_periods`):
 | **1 thread** | 0 / 0 | **0** / 55 | 50 / 60 |
 | **2 threads** | 0 / 0 | 47 / 54 | 50 / 55 |
 | **8 threads** | 0 / 0 | 48 / 55 | 51 / 57 |
+
+Reading a cell: "47 / 54" = of the 54 quota windows that elapsed during this run, the group was frozen in 47 — throttled in 87 % of them.
 
 *(Side note: in the unlimited column `nr_periods` did not advance at all — bandwidth accounting only runs while a limit is set. And the unlimited 2-thread cell measured 858 vs 955 in §3.4: t3 CPU credits were beginning to erode; watch `%st`.)*
 
