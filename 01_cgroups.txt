@@ -1,0 +1,260 @@
+Makinemiz;
+----------
+T3.LARGE AMAZON = 1 CPU (2vCPU)
+The Amazon EC2 t3.large instance features 2 vCPUs backed by 1 physical hyperthreaded core (or one full physical core equivalent via AWS's hyperthreading allocation),
+
+ssh ubuntu@23.20.143.219
+
+Komutlarimiz
+------------
+lscpu | head -20
+nproc
+cat /sys/fs/cgroup/cgroup.controllers
+ls /sys/fs/cgroup/
+cat /sys/fs/cgroup/cgroup.subtree_control
+
+01) Kendi CGroups'umuzu yaratalim
+---------------------------------
+
+Gereken komutlar;
+-----------------
+sudo mkdir /sys/fs/cgroup/lab
+ls /sys/fs/cgroup/lab/ | head
+cat /sys/fs/cgroup/lab/cpu.max
+
+Bunu yaptigimizda otomatik olarak bir dizi dosya ve folder olusur lab'in altinda.
+
+Cat ciktisina bakalim;
+
+ubuntu@ip-172-31-46-49:/sys/fs/cgroup/lab$ cat /sys/fs/cgroup/lab/cpu.max
+max 100000
+
+max 100000
+ ↑      ↑
+quota  period (µs)
+
+bu cgroup'un en güzel numarası. mkdir'i disk'e değil kernel'e yaptın; kernel "yeni cgroup istiyor" deyip kontrol panelini anında içine döşedi. Dizini rmdir ile silince cgroup da ölür.
+
+period = 100000 µs = 100 ms'lik tekrar eden pencere.
+quota = bu pencere içinde bu cgroup'taki tüm process'lerin toplam harcayabileceği CPU süresi. max = sınırsız.
+
+Örnekler:
+
+50000 100000 → her 100 ms'de en fazla 50 ms CPU = yarım vCPU (k8s'teki 500m budur!)
+200000 100000 → 200 ms / 100 ms = 2 vCPU
+Quota biterse kernel process'i period sonuna kadar dondurur = throttling.
+
+TEST
+----
+bir ssh pencersinde bunu kos;
+
+bash -c 'while :; do :; done' & echo "PID: $!"
+
+Diger bir ssh pencersinde bunu kos;
+
+top -p <PID>
+
+ssh terminal1;
+--------------
+ubuntu@ip-172-31-46-49:~$ bash -c 'while :; do :; done' & echo "PID: $!"
+[1] 11254
+PID: 11254
+
+ssh terminal2;
+--------------
+top -p 11254
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND                                                                                                                                                                    
+  11254 ubuntu    20   0    7764   3540   3276 R 100.0   0.0   1:10.29 bash  
+
+ssh terminal3;
+--------------
+echo 11254 | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+
+ayrica limiti sik;
+
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+
+top'ta %CPU'nun ~100'den ~50'ye düşüşünü izle. Gördüğünde bana top'tan o satırı ve şunun çıktısını getir:
+
+
+cat /sys/fs/cgroup/lab/cpu.stat
+
+
+canli oynamalar;
+----------------
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+echo "20000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+echo "max 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+
+
+cat /sys/fs/cgroup/lab/cpu.stat
+-------------------------------
+nr_periods — kaç tane 100 ms'lik pencere geçti
+nr_throttled — kaç penceresinde "quota bitti, dondurdum" dedi
+throttled_usec — toplam dondurulmuş süre (µs)
+
+
+deneyi sonlandirma;
+
+kill 11254
+sudo rmdir /sys/fs/cgroup/lab
+
+
+DENEY 1) TEMEL CGROUP DENEYI GENEL
+----------------------------------
+# 1. Hücreyi yarat
+sudo mkdir /sys/fs/cgroup/lab
+
+# 2. Yükü başlat, PID'i not et
+bash -c 'while :; do :; done' & echo "PID: $!"
+
+# 3. Limiti kur: her 100ms'de 50ms = yarım vCPU
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+
+# 4. Process'i hücreye koy (limit o an biner)
+echo <PID> | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+
+# 5. İzle: top'ta %CPU ≈ 50, kernel itirafı cpu.stat'ta
+top -p <PID>
+cat /sys/fs/cgroup/lab/cpu.stat        # nr_throttled artıyor mu?
+
+# 6. Canlı oyna: %20 → limitsiz
+echo "20000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+echo "max 100000"   | sudo tee /sys/fs/cgroup/lab/cpu.max
+
+# 7. Temizlik
+kill <PID>
+sudo rmdir /sys/fs/cgroup/lab
+
+METADATA
+--------
+cat /sys/fs/cgroup/lab/cpu.stat
+cat /sys/fs/cgroup/lab/cgroup.procs
+cat /proc/11496/cgroup
+cat /sys/fs/cgroup/lab/cpu.max
+
+
+DENEY 2) iki tane tanimli cgroup catismasi 100-300
+--------------------------------------------------
+TANIM: Deney: weight yarışı — iki özdeş sonsuz döngüyü aynı CPU'ya hapsedip pay oranının (100:300) top'a nasıl yansıdığını görmek.
+
+cpu.weight nedir?
+cpu.weight — limit değil, yarış payı
+
+Fark tek cümlede: cpu.max tavandır ("asla bundan fazlası yok"), cpu.weight paydır ("kavga çıkarsa payın bu; boşsa hepsini al").
+
+Aralık 1–10000, default 100. Mutlak değil, göreli: weight 300 olan, weight 100 olana karşı 3'e 1 alır.
+CPU boşken hükümsüz — weight 1 bile olsan idle CPU'yu tek başına %100 kullanırsın. Bu yüzden weight throttle etmez, nr_throttled artırmaz.
+k8s bağlantısı: requests: cpu → cpu.weight'e çevrilir. "Request garanti, limit tavan" cümlesinin kernel'deki gerçeği budur.
+
+Deney tasarımı: 2 vCPU'muz var; 2 döngü koşturursak herkes kendi vCPU'suna kaçar, kavga çıkmaz, weight görünmez. Kavgayı zorlamak için ikisini de CPU 0'a hapsedeceğiz (cpuset.cpus — bonus olarak üçüncü controller'ı da görmüş olacaksın).
+
+
+# 1. İki hücre yarat
+sudo mkdir /sys/fs/cgroup/w100-lab /sys/fs/cgroup/w300-lab
+
+# 2. İkisini de CPU 0'a kilitle (kavga çıksın diye; 2 vCPU'da yoksa herkes kendi köşesine kaçar)
+echo 0 | sudo tee /sys/fs/cgroup/w100-lab/cpuset.cpus
+echo 0 | sudo tee /sys/fs/cgroup/w300-lab/cpuset.cpus
+
+# 3. Payları kur: w100-lab default 100'de kalıyor, w300-lab'e 300 ver
+echo 300 | sudo tee /sys/fs/cgroup/w300-lab/cpu.weight
+
+# 4. İki özdeş yük başlat, PID'leri not et
+bash -c 'while :; do :; done' & echo "PID_100: $!"
+bash -c 'while :; do :; done' & echo "PID_300: $!"
+
+# 5. Her birini kendi hücresine koy
+echo <PID_100> | sudo tee /sys/fs/cgroup/w100-lab/cgroup.procs
+echo <PID_300> | sudo tee /sys/fs/cgroup/w300-lab/cgroup.procs
+
+# 6. İkisini birden izle
+top -p <PID_100> -p <PID_300>
+
+# 7. "Boşsa hepsini al" kanıtı: 300'lük olanı öldür, kalanı izle
+kill <PID_300>
+
+# 8. Temizlik
+kill <PID_100>
+sudo rmdir /sys/fs/cgroup/w100-lab /sys/fs/cgroup/w300-lab
+
+Deney run
+---------
+PID_100: 11663
+PID_300: 11664
+
+echo 11663 | sudo tee /sys/fs/cgroup/w100-lab/cgroup.procs
+echo 11664 | sudo tee /sys/fs/cgroup/w300-lab/cgroup.procs
+
+
+top -p 11663 -p 11664
+
+
+
+
+DENEY 3) Tree yapisindaki Cgroup Tree-lab deneyi
+------------------------------------------------
+Tanım: Parent cgroup'a 1 vCPU'luk zaman tavanı (cpu.max) koyup, altındaki iki çocuğa (w100, w300) birer sonsuz döngü yerleştiriyoruz. cpuset yok — process'ler 2 vCPU'ya serbestçe dağılabilir.
+
+Soru: Makinede 2 vCPU boşta dururken, process'ler ayrı CPU'lara kaçarak parent tavanından kurtulabilir mi? Ve parent'ın pastasını çocuklar weight oranında (100:300) mı bölüşür?
+
+Beklenen cevap: Kurtulamazlar — quota CPU başına değil cgroup toplamına sayılır; ayrı CPU'lara dağılmak sadece bütçeyi 2× hızlı bitirir, sonra ikisi birden donar. top beklentisi: ~25 / ~75, toplam ~100 (2 vCPU'luk makinenin yarısı). Parent'ı yarıya indirince (adım 9): ~12.5 / ~37.5. Ek kanıt: parent'ın cpu.stat'ında nr_throttled artar.
+
+
+# ── KURULUM ────────────────────────────────────────────
+# 1. Parent'ı yarat
+sudo mkdir /sys/fs/cgroup/tree-lab
+
+# 2. Çocuklara cpu VE cpuset controller'larını aç (yapmazsan çocuklarda o dosyalar olmaz)
+echo "+cpu +cpuset" | sudo tee /sys/fs/cgroup/tree-lab/cgroup.subtree_control
+
+# 3. Çocukları yarat, dosyaların geldiğini doğrula
+sudo mkdir /sys/fs/cgroup/tree-lab/w100 /sys/fs/cgroup/tree-lab/w300
+ls /sys/fs/cgroup/tree-lab/w100/ | grep cpu
+
+# 4. Pasta: parent'a yarım vCPU tavan
+echo "50000 100000" | sudo tee /sys/fs/cgroup/tree-lab/cpu.max
+
+# 5. Paylar: w100 default (100) kalır, w300'e 300
+echo 300 | sudo tee /sys/fs/cgroup/tree-lab/w300/cpu.weight
+
+# 6. İki özdeş yük
+bash -c 'while :; do :; done' & echo "PID_100: $!"
+bash -c 'while :; do :; done' & echo "PID_300: $!"
+
+# 7. Process'leri YAPRAKLARA koy (parent'a koymak reddedilir)
+echo <PID_100> | sudo tee /sys/fs/cgroup/tree-lab/w100/cgroup.procs
+echo <PID_300> | sudo tee /sys/fs/cgroup/tree-lab/w300/cgroup.procs
+
+# ── PERDE A: kavgasız quota ────────────────────────────
+top -p <PID_100> -p <PID_300>
+# → ~25 / ~25: 50ms'lik pastayı 2 vCPU'da aynı anda yakıp 25ms'de bitiriyorlar.
+#   Ayrı CPU'lardalar, itişme yok → weight İŞLEMİYOR.
+cat /sys/fs/cgroup/tree-lab/cpu.stat   # nr_throttled parent'ta artıyor
+
+# ── PERDE B: aynı CPU'ya kilitle, weight uyanır ────────
+echo 0 | sudo tee /sys/fs/cgroup/tree-lab/w100/cpuset.cpus
+echo 0 | sudo tee /sys/fs/cgroup/tree-lab/w300/cpuset.cpus
+# top → ~12.5 / ~37.5: aynı 50ms pasta, artık weight 100:300 bölüyor.
+
+# ── PERDE C: pastayı büyüt, sahne tamamen weight'in ────
+echo "100000 100000" | sudo tee /sys/fs/cgroup/tree-lab/cpu.max
+# top → ~25 / ~75: CPU 0 zaten en fazla 100ms verebilir, quota görünmez oldu.
+
+# ── TEMİZLİK (en sonda!) ───────────────────────────────
+kill <PID_100> <PID_300>
+sudo rmdir /sys/fs/cgroup/tree-lab/w100 /sys/fs/cgroup/tree-lab/w300
+sudo rmdir /sys/fs/cgroup/tree-lab
+
+
+
+deney run;
+
+PID_100: 12054
+PID_300: 12055
+
+echo 12054 | sudo tee /sys/fs/cgroup/tree-lab/w100/cgroup.procs
+echo 12055 | sudo tee /sys/fs/cgroup/tree-lab/w300/cgroup.procs
+
+top -p 12054 -p 12055

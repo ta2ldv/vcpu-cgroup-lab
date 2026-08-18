@@ -1,0 +1,78 @@
+1 Temel kavramlar — CPU/core/hyperthread → vCPU ne demek (hypervisor tarafı) → Linux scheduler'ın gördüğü şey.
+2 cgroup v2 elle: cpu.max, cpu.weight, cpu.stat — throttling'i kendi gözünle görmek.
+3 Rust ile yük üreteci — thread sayısı vs vCPU sayısı, concurrency ≠ parallelism farkını ölçerek.
+4 Kubernetes — requests/limits → cgroup dosyalarına nasıl dönüşüyor, CFS throttling, available_parallelism() yalanı.
+
+lscpu | head -20; echo ---; nproc; echo ---; cat /sys/fs/cgroup/cgroup.controllers
+
+
+nproc / fizksel cpu / logical cpu
+---------------------------------
+nproc hep logical basar ama lscpu çıktısında hesap açık:
+
+Socket(s): 1
+Core(s) per socket: 4      ← fiziksel = 1 × 4 = 4
+Thread(s) per core: 2      ← logical  = 4 × 2 = 8
+
+lscpu -e 
+
+ubuntu@ip-10-0-0-169:~$ lscpu -e
+CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE
+  0    0      0    0 0:0:0:0          yes
+  1    0      0    0 0:0:0:0          yes
+
+BOLUM 1
+=======
+
+Makinemiz;
+----------
+T3.LARGE AMAZON = 1 CPU (2vCPU)
+The Amazon EC2 t3.large instance features 2 vCPUs backed by 1 physical hyperthreaded core (or one full physical core equivalent via AWS's hyperthreading allocation),
+
+Komutlarimiz
+------------
+lscpu | head -20
+nproc
+cat /sys/fs/cgroup/cgroup.controllers
+ls /sys/fs/cgroup/
+cat /sys/fs/cgroup/cgroup.subtree_control
+
+Komut ciktilarimiz
+------------------
+ubuntu@ip-172-31-46-49:~$ lscpu | head -20
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           46 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  2
+On-line CPU(s) list:                     0,1
+Vendor ID:                               GenuineIntel
+Model name:                              Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz
+CPU family:                              6
+Model:                                   85
+Thread(s) per core:                      2
+Core(s) per socket:                      1
+Socket(s):                               1
+Stepping:                                7
+BogoMIPS:                                4999.99
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault pti fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves ida arat pku ospke
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               32 KiB (1 instance)
+L1i cache:                               32 KiB (1 instance)
+
+ubuntu@ip-172-31-46-49:~$ nproc
+2
+
+ubuntu@ip-172-31-46-49:~$ cat /sys/fs/cgroup/cgroup.controllers
+cpuset cpu io memory hugetlb pids rdma misc
+
+ubuntu@ip-172-31-46-49:~$ ls /sys/fs/cgroup/
+cgroup.controllers      cgroup.procs            cpu.pressure           cpuset.cpus.isolated   init.scope     io.prio.class     memory.reclaim          misc.current                   sys-kernel-debug.mount
+cgroup.max.depth        cgroup.stat             cpu.stat               cpuset.mems.effective  io.cost.model  io.stat           memory.stat             proc-sys-fs-binfmt_misc.mount  sys-kernel-tracing.mount
+cgroup.max.descendants  cgroup.subtree_control  cpu.stat.local         dev-hugepages.mount    io.cost.qos    memory.numa_stat  memory.zswap.writeback  sys-fs-fuse-connections.mount  system.slice
+cgroup.pressure         cgroup.threads          cpuset.cpus.effective  dev-mqueue.mount       io.pressure    memory.pressure   misc.capacity           sys-kernel-config.mount        user.slice
+
+
+ubuntu@ip-172-31-46-49:~$ cat /sys/fs/cgroup/cgroup.subtree_control
+cpuset cpu io memory pids
