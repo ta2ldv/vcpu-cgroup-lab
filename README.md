@@ -34,7 +34,8 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [3.2 First measurement — a self-measuring, single-thread burner](#32-first-measurement--a-self-measuring-single-thread-burner)
   - [3.3 Version 2 — clean measurement, N threads](#33-version-2--clean-measurement-n-threads)
   - [3.4 Thread sweep — the parallelism wall, measured](#34-thread-sweep--the-parallelism-wall-measured)
-- [Part 4 — Kubernetes requests & limits](#part-4--kubernetes-requests--limits-coming-soon)
+- [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-coming-soon)
+- [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 
 ## Curriculum
 
@@ -43,7 +44,8 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 | 1 | [CPU fundamentals](#part-1--cpu-fundamentals) | What is a core, a hyperthread, a vCPU — and who schedules whom? | ✅ |
 | 2 | [cgroup v2 by hand](#part-2--cgroup-v2-by-hand) | How does the kernel slice CPU time, and how do I watch it happen? | ✅ |
 | 3 | Rust load generator | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | 🔜 |
-| 4 | Kubernetes requests/limits | How do `requests`/`limits` translate to cgroup files, and why does `available_parallelism()` lie? | 🔜 |
+| 4 | Async Rust (tokio) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | 🔜 |
+| 5 | Kubernetes requests/limits | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
 
 ---
 
@@ -482,7 +484,7 @@ cargo new hello && cd hello && cargo run   # prints "Hello, world!" ⇒ toolchai
 Don't confuse the two flags that appear side by side (and `-0`, digit zero, is not a flag at all):
 
 ```bash
-rustc -O burners/02_threads.rs -o burn
+rustc -O burners/02_threads.rs -o burners/bin/02_threads
 #      ↑ capital O: Optimize        ↑ lowercase o: output — names the binary
 ```
 
@@ -613,14 +615,14 @@ One binary, one variable: the thread count. Plus one special run — 2 threads p
 Two programs have appeared so far, and they play different roles:
 
 - **`01_baseline.rs` is a teaching demo, not a reference.** Its job was to expose the *clock problem*: it read the clock on every iteration, and since a clock read costs ~17× more than the counting itself, its number (34.5 M iter/s) measured clock reads, not work (§3.2).
-- **`./burn 1` (i.e. `02_threads.rs` with 1 thread) is the reference.** With the clock problem fixed (one clock read per million iterations), one thread on one vCPU produces **578 M iter/s** — "what one vCPU is worth." **Every comparison below is against this number**, never against 01.
+- **`02_threads 1` (i.e. `02_threads.rs` with 1 thread) is the reference.** With the clock problem fixed (one clock read per million iterations), one thread on one vCPU produces **578 M iter/s** — "what one vCPU is worth." **Every comparison below is against this number**, never against 01.
 
 ### The tool: `taskset`
 
 `taskset` sets a process's **CPU affinity**: the set of logical CPUs the kernel scheduler is allowed to place it on. `taskset -c 0 <cmd>` launches `<cmd>` allowed on CPU 0 only — the process's threads all inherit the restriction, so two busy threads have no choice but to take turns on one vCPU.
 
 ```bash
-taskset -c 0 ./burn 2     # launch pinned to CPU 0 only
+taskset -c 0 burners/bin/02_threads 2     # launch pinned to CPU 0 only
 taskset -c 0,1 <cmd>      # launch allowed on CPUs 0 and 1 (ranges work too: -c 0-3)
 taskset -cp <pid>         # show a running process's current affinity
 taskset -cp 0 <pid>       # re-pin a running process to CPU 0, live
@@ -629,7 +631,7 @@ taskset -cp 0 <pid>       # re-pin a running process to CPU 0, live
 Why we need it here: without it, the scheduler immediately spreads 2 busy threads across our 2 vCPUs, and concurrency and parallelism rise together — indistinguishable. Pinning removes the parallelism while keeping the concurrency, which is exactly the variable we want to isolate. What the scheduler does in each case, on a timeline:
 
 ```
-./burn 2  (both CPUs allowed)              taskset -c 0 ./burn 2  (CPU 0 only)
+02_threads 2  (both CPUs allowed)          taskset -c 0 02_threads 2  (CPU 0 only)
 CPU 0: AAAAAAAAAAAAAAAA                    CPU 0: AAAA BBBB AAAA BBBB ...
 CPU 1: BBBBBBBBBBBBBBBB                    CPU 1: (idle)
 → A and B truly simultaneous              → A and B take turns; at any instant
@@ -648,12 +650,12 @@ Relation to Part 2's `cpuset.cpus` — same kernel capability, two interfaces:
 | Typical use | quick experiments, benchmarks | containers, Kubernetes static CPU manager |
 
 ```bash
-rustc -O burners/02_threads.rs -o burn
-./burn 1
-./burn 2
-taskset -c 0 ./burn 2
-./burn 4
-./burn 8
+rustc -O burners/02_threads.rs -o burners/bin/02_threads
+burners/bin/02_threads 1
+burners/bin/02_threads 2
+taskset -c 0 burners/bin/02_threads 2
+burners/bin/02_threads 4
+burners/bin/02_threads 8
 ```
 
 Real output (t3.large — 2 vCPUs = 2 SMT threads of **one** physical core):
@@ -666,23 +668,23 @@ Real output (t3.large — 2 vCPUs = 2 SMT threads of **one** physical core):
 8 thread(s): 4249000000 iters in 5.01 s  ->  848 M iter/s total
 ```
 
-| Run | Concurrency | Parallelism | M iter/s | vs `./burn 1` |
+| Run | Concurrency | Parallelism | M iter/s | vs `02_threads 1` |
 |---|---|---|---|---|
-| `./burn 1` | 1 | 1 | 578 | **1.00× (reference)** |
-| `./burn 2` | 2 | 2 | **955** | **1.65×** — not 2×! |
-| `taskset -c 0 ./burn 2` | 2 | **1** | **577** | **1.00×** |
-| `./burn 4` | 4 | 2 | 929 | 1.61× |
-| `./burn 8` | 8 | 2 | 848 | 1.47× |
+| `02_threads 1` | 1 | 1 | 578 | **1.00× (reference)** |
+| `02_threads 2` | 2 | 2 | **955** | **1.65×** — not 2×! |
+| `taskset -c 0 02_threads 2` | 2 | **1** | **577** | **1.00×** |
+| `02_threads 4` | 4 | 2 | 929 | 1.61× |
+| `02_threads 8` | 8 | 2 | 848 | 1.47× |
 
 ### Run by run
 
-**`./burn 1` — the reference.** One thread, one vCPU busy, one idle. Purpose: establish the unit "what one vCPU is worth" (578 M iter/s). Every other row is judged against this number.
+**`02_threads 1` — the reference.** One thread, one vCPU busy, one idle. Purpose: establish the unit "what one vCPU is worth" (578 M iter/s). Every other row is judged against this number.
 
-**`./burn 2` — full parallelism.** Two threads, two vCPUs, no restrictions — the machine's best case. Naive expectation: 2× = 1156. Measured: **955 = 1.65×**. The missing 35 % is SMT: these two vCPUs are the two order boards of *one* kitchen (§1.2); the threads share the core's execution units. The SMT bonus is workload-dependent (rule of thumb +20–30 %; this add-loop got +65 %), but it is never +100 %. **"2 vCPUs" ≠ "2 cores" — here is the measurement.**
+**`02_threads 2` — full parallelism.** Two threads, two vCPUs, no restrictions — the machine's best case. Naive expectation: 2× = 1156. Measured: **955 = 1.65×**. The missing 35 % is SMT: these two vCPUs are the two order boards of *one* kitchen (§1.2); the threads share the core's execution units. The SMT bonus is workload-dependent (rule of thumb +20–30 %; this add-loop got +65 %), but it is never +100 %. **"2 vCPUs" ≠ "2 cores" — here is the measurement.**
 
-**`taskset -c 0 ./burn 2` — concurrency without parallelism.** The control experiment: same two threads, but confined to CPU 0, so they *take turns* instead of running simultaneously. Concurrency is 2; parallelism is 1. Measured: **577 ≈ the 1-thread baseline exactly**. Doubling concurrency moved the work rate by nothing. **Parallelism gives speed; concurrency only gives structure** (useful for overlapping waits — but there is nothing to wait for in a pure compute loop).
+**`taskset -c 0 02_threads 2` — concurrency without parallelism.** The control experiment: same two threads, but confined to CPU 0, so they *take turns* instead of running simultaneously. Concurrency is 2; parallelism is 1. Measured: **577 ≈ the 1-thread baseline exactly**. Doubling concurrency moved the work rate by nothing. **Parallelism gives speed; concurrency only gives structure** (useful for overlapping waits — but there is nothing to wait for in a pure compute loop).
 
-**`./burn 4` and `./burn 8` — past the wall.** More threads than the hardware can run at once: parallelism stays pinned at 2 while concurrency grows. Expectation: flat at ~955. Measured: **929 and 848 — flat, then sagging** (~11 % below the peak at 8 threads).
+**`02_threads 4` and `02_threads 8` — past the wall.** More threads than the hardware can run at once: parallelism stays pinned at 2 while concurrency grows. Expectation: flat at ~955. Measured: **929 and 848 — flat, then sagging** (~11 % below the peak at 8 threads).
 
 Where does the loss come from? Follow the mechanics:
 
@@ -701,6 +703,78 @@ A subtlety that makes our −11 % a *best case*: these iterations are fully inde
 2. **Thread count is a statement about structure, not speed**; speed is capped by available parallel hardware.
 3. **Oversubscription has a price** — and in Part 3's cgroup experiments this price will grow teeth: 8 threads against a capped quota burn the budget 8× faster, then freeze together.
 
-# Part 4 — Kubernetes requests & limits *(coming soon)*
+## 3.5 The thread × quota matrix
 
-Walking the cgroup tree that kubelet builds (`kubepods.slice/...`), mapping `requests`/`limits` to the exact files from Part 2, observing CFS throttling on real pods on OpenShift, and why runtime thread-pool sizing needs to be cgroup-aware.
+Part 2 throttled a toy loop and watched `top`; now we throttle the *measuring instrument* and read real numbers. Two variables, one grid: thread count (1 / 2 / 8) × `cpu.max` (unlimited / 1 vCPU / 0.5 vCPU) — nine cells.
+
+### Method: a caged shell
+
+A benchmark run lasts 5 seconds — too short to catch its PID and move it into a cgroup mid-flight. The fix uses an inheritance rule: **a process is born into its parent's cgroup.** So we place the *shell* into the cage once; every command it launches afterwards starts inside from its first instruction.
+
+The whole experiment runs in **one terminal**: once the shell is caged, the quota changes (`sudo tee`) and `cpu.stat` reads also run inside the cage — they are instantaneous and don't disturb the measurements.
+
+```bash
+# Create the cell, then cage this very shell ($$ is the shell's own PID)
+sudo mkdir /sys/fs/cgroup/lab
+echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+cat /proc/$$/cgroup                    # must say 0::/lab
+
+# For each column: set the quota, then run the three thread counts,
+# reading the kernel's witness after EVERY run.
+echo "max 100000"    | sudo tee /sys/fs/cgroup/lab/cpu.max   # column 1: unlimited
+# (column 2: "100000 100000" = 1 vCPU · column 3: "50000 100000" = 0.5 vCPU)
+
+burners/bin/02_threads 1
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+burners/bin/02_threads 2
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+burners/bin/02_threads 8
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+
+# Cleanup — gotcha included: rmdir will fail with "Device or resource busy"
+# while your shell is still inside. Evict yourself first (move back to the root
+# cgroup), then remove the cell:
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
+cat /proc/$$/cgroup                    # 0::/ — free again
+sudo rmdir /sys/fs/cgroup/lab
+```
+
+Why read `cpu.stat` after every run, not once per column? The counters are **cumulative**; only per-run differences attribute the blame. `nr_periods` counts elapsed quota windows, `nr_throttled` counts the windows in which the group was frozen for exhausting its budget — the same counter Kubernetes exports to Prometheus as `container_cpu_cfs_throttled_periods_total`, the number-one metric behind every "my pod is slow" investigation.
+
+### Results
+
+Throughput (M iter/s):
+
+| | unlimited | 1 vCPU | 0.5 vCPU |
+|---|---|---|---|
+| **1 thread** | 581 | 574 | 288 |
+| **2 threads** | 858 | 489 | 241 |
+| **8 threads** | 854 | 490 | 250 |
+
+Kernel witness (per-run Δ`nr_throttled` / Δ`nr_periods`):
+
+| | unlimited | 1 vCPU | 0.5 vCPU |
+|---|---|---|---|
+| **1 thread** | 0 / 0 | **0** / 55 | 50 / 60 |
+| **2 threads** | 0 / 0 | 47 / 54 | 50 / 55 |
+| **8 threads** | 0 / 0 | 48 / 55 | 51 / 57 |
+
+*(Side note: in the unlimited column `nr_periods` did not advance at all — bandwidth accounting only runs while a limit is set. And the unlimited 2-thread cell measured 858 vs 955 in §3.4: t3 CPU credits were beginning to erode; watch `%st`.)*
+
+### What the grid teaches
+
+**Row 1 — quota is honest with a single thread.** 581 → 574 → 288: no measurable cost at 1 vCPU, exactly half at half a vCPU. And the subtle gem: at 1 vCPU, Δ`nr_throttled` = **0** — a single thread physically cannot occupy more than one CPU, so it never touches the budget ceiling. Kubernetes translation: **a limit larger than what the app can use is neutral** — it neither helps nor hurts.
+
+**Column 2 — the bombshell: 2 threads under a 1-vCPU quota produce *less* than 1 thread (489 < 574).** Same budget, more workers, less work. Mechanics: two threads burn the 100 ms budget on both SMT siblings at 2× speed — gone in ~50 ms, frozen for the rest — but an SMT pair only produces ~1.65× while running. **A quota-millisecond spent on an SMT pair yields less work than one spent on a full CPU**, and the freeze/wake cycle adds its own tax. The kernel confirms: throttled in ~87 % of windows. This is the production riddle "we set `limit: 1` — why is the app slower than single-threaded?" answered with a grid cell.
+
+**Column 3 — the painful cell.** One thread takes the clean half (288); 2 and 8 threads pay a further ~15 % tax (241–250) while pinning the throttle ratio to ~90 %. Throughput, however, is the *mild* symptom — the real damage of many-threads-under-tight-quota is the freeze pattern, which §3.6 measures directly.
+
+**The sizing rule this grid proves:** under a CPU limit, match the thread count to the limit (⌈limit⌉ threads), not to what `nproc` claims. Extra threads under a tight quota are pure loss: same or less throughput, maximal throttling.
+
+# Part 4 — Async Rust: tokio and the vCPU *(coming soon)*
+
+The async chapter: tokio's runtime model (a few OS worker threads carrying many lightweight tasks), how the worker pool is sized from `std::thread::available_parallelism()`, what that call actually reports inside a limited cgroup, and async counterparts of the Part 3 experiments — CPU-bound vs IO-bound tasks under the same quotas. Cargo returns here (tokio is an external crate).
+
+# Part 5 — Kubernetes requests & limits *(coming soon)*
+
+The synthesis: every workload from Parts 3–4 — sync threads and async tasks — deployed as pods on OpenShift, with the experiment matrix replayed in YAML. Walking the cgroup tree that kubelet builds (`kubepods.slice/...`), mapping `requests`/`limits` to the exact files from Part 2, observing CFS throttling on real pods, and judging each request/limit combination as *helpful, harmful, or neutral* for each workload type.

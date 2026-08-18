@@ -34,7 +34,8 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [3.2 İlk ölçüm — kendi kendini ölçen tek thread'lik yakıcı](#32-i̇lk-ölçüm--kendi-kendini-ölçen-tek-threadlik-yakıcı)
   - [3.3 Sürüm 2 — temiz ölçüm, N thread](#33-sürüm-2--temiz-ölçüm-n-thread)
   - [3.4 Thread taraması — parallelism duvarı, ölçülmüş](#34-thread-taraması--parallelism-duvarı-ölçülmüş)
-- [Bölüm 4 — Kubernetes requests & limits](#bölüm-4--kubernetes-requests--limits-yakında)
+- [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-yakında)
+- [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 
 ## Müfredat
 
@@ -43,7 +44,8 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 | 1 | [Temel kavramlar](#bölüm-1--temel-kavramlar) | Core, hyperthread, vCPU nedir — kim kimi zamanlar? | ✅ |
 | 2 | [cgroup v2 elle](#bölüm-2--cgroup-v2-elle) | Kernel CPU zamanını nasıl dilimler, bunu nasıl canlı izlerim? | ✅ |
 | 3 | Rust ile yük üreteci | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | 🔜 |
-| 4 | Kubernetes requests/limits | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, `available_parallelism()` neden yalan söyler? | 🔜 |
+| 4 | Async Rust (tokio) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | 🔜 |
+| 5 | Kubernetes requests/limits | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
 
 ---
 
@@ -482,7 +484,7 @@ cargo new hello && cd hello && cargo run   # "Hello, world!" basarsa toolchain t
 Yan yana geçen iki bayrağı karıştırma (`-0` — rakam sıfır — diye bir bayrak ise hiç yok):
 
 ```bash
-rustc -O burners/02_threads.rs -o burn
+rustc -O burners/02_threads.rs -o burners/bin/02_threads
 #      ↑ büyük O: Optimize          ↑ küçük o: output — binary'nin adını verir
 ```
 
@@ -613,14 +615,14 @@ Tek binary, tek değişken: thread sayısı. Artı bir özel koşu — tek CPU'y
 Şimdiye kadar iki program göründü ve rolleri farklı:
 
 - **`01_baseline.rs` bir öğretim demosudur, referans değildir.** Görevi *saat sorununu* göstermekti: her iterasyonda saat okuyordu ve bir saat okuması saymanın kendisinden ~17× pahalı olduğu için sayısı (34.5 M iter/s) işi değil, saat okumalarını ölçüyordu (§3.2).
-- **`./burn 1` (yani 1 thread'li `02_threads.rs`) referanstır.** Saat sorunu çözülünce (milyon iterasyonda bir okuma), tek vCPU'daki tek thread **578 M iter/s** üretir — "bir vCPU'nun değeri". **Aşağıdaki her karşılaştırma bu sayıya göredir**, asla 01'e göre değil.
+- **`02_threads 1` (yani 1 thread'li `02_threads.rs`) referanstır.** Saat sorunu çözülünce (milyon iterasyonda bir okuma), tek vCPU'daki tek thread **578 M iter/s** üretir — "bir vCPU'nun değeri". **Aşağıdaki her karşılaştırma bu sayıya göredir**, asla 01'e göre değil.
 
 ### Araç: `taskset`
 
 `taskset`, bir process'in **CPU affinity**'sini ayarlar: kernel scheduler'ının onu koyabileceği logical CPU kümesi. `taskset -c 0 <komut>`, `<komut>`'u yalnız CPU 0'da koşmaya izinli başlatır — process'in tüm thread'leri kısıtı miras alır; iki aç thread'in tek vCPU'da sırayla dönmekten başka çaresi kalmaz.
 
 ```bash
-taskset -c 0 ./burn 2     # yalnız CPU 0'a kilitli başlat
+taskset -c 0 burners/bin/02_threads 2     # yalnız CPU 0'a kilitli başlat
 taskset -c 0,1 <komut>    # CPU 0 ve 1'e izinli başlat (aralık da olur: -c 0-3)
 taskset -cp <pid>         # koşan bir process'in mevcut affinity'sini göster
 taskset -cp 0 <pid>       # koşan process'i canlı canlı CPU 0'a kilitle
@@ -629,7 +631,7 @@ taskset -cp 0 <pid>       # koşan process'i canlı canlı CPU 0'a kilitle
 Burada neden lazım: onsuz, scheduler 2 aç thread'i anında 2 vCPU'ya yayar; concurrency ile parallelism birlikte yükselir — ayırt edilemez. Pinleme, concurrency'yi tutarken parallelism'i söker; izole etmek istediğimiz değişken tam olarak bu. Scheduler'ın iki durumda yaptığı, zaman çizgisinde:
 
 ```
-./burn 2  (iki CPU da serbest)             taskset -c 0 ./burn 2  (yalnız CPU 0)
+02_threads 2  (iki CPU da serbest)         taskset -c 0 02_threads 2  (yalnız CPU 0)
 CPU 0: AAAAAAAAAAAAAAAA                    CPU 0: AAAA BBBB AAAA BBBB ...
 CPU 1: BBBBBBBBBBBBBBBB                    CPU 1: (boş)
 → A ile B gerçekten eşzamanlı             → A ile B sırayla; herhangi bir anda
@@ -648,12 +650,12 @@ Bölüm 2'deki `cpuset.cpus` ile ilişkisi — aynı kernel yeteneği, iki aray�
 | Tipik kullanım | hızlı deneyler, benchmark | container'lar, Kubernetes static CPU manager |
 
 ```bash
-rustc -O burners/02_threads.rs -o burn
-./burn 1
-./burn 2
-taskset -c 0 ./burn 2
-./burn 4
-./burn 8
+rustc -O burners/02_threads.rs -o burners/bin/02_threads
+burners/bin/02_threads 1
+burners/bin/02_threads 2
+taskset -c 0 burners/bin/02_threads 2
+burners/bin/02_threads 4
+burners/bin/02_threads 8
 ```
 
 Gerçek çıktı (t3.large — 2 vCPU = **tek** fiziksel core'un 2 SMT thread'i):
@@ -666,23 +668,23 @@ Gerçek çıktı (t3.large — 2 vCPU = **tek** fiziksel core'un 2 SMT thread'i)
 8 thread(s): 4249000000 iters in 5.01 s  ->  848 M iter/s total
 ```
 
-| Koşu | Concurrency | Parallelism | M iter/s | `./burn 1`'e göre |
+| Koşu | Concurrency | Parallelism | M iter/s | `02_threads 1`'e göre |
 |---|---|---|---|---|
-| `./burn 1` | 1 | 1 | 578 | **1.00× (referans)** |
-| `./burn 2` | 2 | 2 | **955** | **1.65×** — 2× değil! |
-| `taskset -c 0 ./burn 2` | 2 | **1** | **577** | **1.00×** |
-| `./burn 4` | 4 | 2 | 929 | 1.61× |
-| `./burn 8` | 8 | 2 | 848 | 1.47× |
+| `02_threads 1` | 1 | 1 | 578 | **1.00× (referans)** |
+| `02_threads 2` | 2 | 2 | **955** | **1.65×** — 2× değil! |
+| `taskset -c 0 02_threads 2` | 2 | **1** | **577** | **1.00×** |
+| `02_threads 4` | 4 | 2 | 929 | 1.61× |
+| `02_threads 8` | 8 | 2 | 848 | 1.47× |
 
 ### Koşu koşu
 
-**`./burn 1` — referans.** Tek thread; bir vCPU dolu, biri boş. Amaç: "bir vCPU'nun değeri" birimini kurmak (578 M iter/s). Diğer her satır bu sayıya göre yargılanır.
+**`02_threads 1` — referans.** Tek thread; bir vCPU dolu, biri boş. Amaç: "bir vCPU'nun değeri" birimini kurmak (578 M iter/s). Diğer her satır bu sayıya göre yargılanır.
 
-**`./burn 2` — tam parallelism.** İki thread, iki vCPU, kısıt yok — makinenin en iyi hali. Naif beklenti: 2× = 1156. Ölçüm: **955 = 1.65×**. Kayıp %35'in adı SMT: bu iki vCPU, *tek* mutfağın iki sipariş panosu (§1.2); thread'ler core'un execution unit'lerini paylaşıyor. SMT kazancı iş yüküne bağlıdır (genel kural +%20–30; bu toplama döngüsü +%65 aldı) ama asla +%100 olmaz. **"2 vCPU" ≠ "2 core" — işte ölçümü.**
+**`02_threads 2` — tam parallelism.** İki thread, iki vCPU, kısıt yok — makinenin en iyi hali. Naif beklenti: 2× = 1156. Ölçüm: **955 = 1.65×**. Kayıp %35'in adı SMT: bu iki vCPU, *tek* mutfağın iki sipariş panosu (§1.2); thread'ler core'un execution unit'lerini paylaşıyor. SMT kazancı iş yüküne bağlıdır (genel kural +%20–30; bu toplama döngüsü +%65 aldı) ama asla +%100 olmaz. **"2 vCPU" ≠ "2 core" — işte ölçümü.**
 
-**`taskset -c 0 ./burn 2` — parallelism'siz concurrency.** Kontrol deneyi: aynı iki thread, ama CPU 0'a hapsedilmiş — aynı anda koşmak yerine *sırayla dönüşüyorlar*. Concurrency 2; parallelism 1. Ölçüm: **577 ≈ 1-thread baseline'ın tıpkısı**. Concurrency'yi ikiye katlamak iş hızını kıpırdatmadı. **Hızı parallelism verir; concurrency yalnızca yapı verir** (beklemeleri örtüştürmeye yarar — ama saf hesap döngüsünde bekleyecek bir şey yok).
+**`taskset -c 0 02_threads 2` — parallelism'siz concurrency.** Kontrol deneyi: aynı iki thread, ama CPU 0'a hapsedilmiş — aynı anda koşmak yerine *sırayla dönüşüyorlar*. Concurrency 2; parallelism 1. Ölçüm: **577 ≈ 1-thread baseline'ın tıpkısı**. Concurrency'yi ikiye katlamak iş hızını kıpırdatmadı. **Hızı parallelism verir; concurrency yalnızca yapı verir** (beklemeleri örtüştürmeye yarar — ama saf hesap döngüsünde bekleyecek bir şey yok).
 
-**`./burn 4` ve `./burn 8` — duvarın ötesi.** Donanımın aynı anda koşturabileceğinden çok thread: parallelism 2'de çakılı, concurrency büyüyor. Beklenti: ~955'te düz çizgi. Ölçüm: **929 ve 848 — önce düz, sonra sarkıyor** (8 thread'de zirvenin ~%11 altı).
+**`02_threads 4` ve `02_threads 8` — duvarın ötesi.** Donanımın aynı anda koşturabileceğinden çok thread: parallelism 2'de çakılı, concurrency büyüyor. Beklenti: ~955'te düz çizgi. Ölçüm: **929 ve 848 — önce düz, sonra sarkıyor** (8 thread'de zirvenin ~%11 altı).
 
 Kayıp nereden geliyor? Mekaniği takip et:
 
@@ -701,6 +703,78 @@ Kayıp nereden geliyor? Mekaniği takip et:
 2. **Thread sayısı hız değil yapı beyanıdır**; hızın tavanını eldeki paralel donanım çizer.
 3. **Oversubscription'ın bedeli vardır** — ve Part 3'ün cgroup deneylerinde bu bedelin dişleri çıkacak: kısıtlı quota'ya karşı 8 thread bütçeyi 8× hızlı yakar, sonra hep birlikte donar.
 
-# Bölüm 4 — Kubernetes requests & limits *(yakında)*
+## 3.5 Thread × quota matrisi
 
-kubelet'in kurduğu cgroup ağacında gezinti (`kubepods.slice/...`), `requests`/`limits`'in Bölüm 2'deki dosyalara birebir eşlenmesi, OpenShift'te gerçek pod'larda CFS throttling gözlemi ve runtime thread-pool boyutlandırmasının neden cgroup-aware olması gerektiği.
+Bölüm 2'de oyuncak bir döngüyü kısıp `top`'a bakmıştık; şimdi *ölçüm aletinin kendisini* kısıp gerçek sayılar okuyoruz. İki değişken, tek ızgara: thread sayısı (1 / 2 / 8) × `cpu.max` (limitsiz / 1 vCPU / 0.5 vCPU) — dokuz hücre.
+
+### Yöntem: kafesteki shell
+
+Bir benchmark koşusu 5 saniye sürüyor — PID'ini yakalayıp uçuş sırasında cgroup'a taşımak için çok kısa. Çözüm bir miras kuralı: **process, parent'ının cgroup'una doğar.** Shell'i kafese bir kez koyarız; ondan sonra başlattığı her komut ilk instruction'ından itibaren içeride başlar.
+
+Deneyin tamamı **tek terminalde** koşar: shell bir kez kafese girince quota değişimleri (`sudo tee`) ve `cpu.stat` okumaları da kafes içinde koşar — anlık işlerdir, ölçümü bozmazlar.
+
+```bash
+# Hücreyi yarat, sonra BU shell'i kafese koy ($$ = shell'in kendi PID'i)
+sudo mkdir /sys/fs/cgroup/lab
+echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+cat /proc/$$/cgroup                    # 0::/lab demeli
+
+# Her kolon için: quota'yı kur, üç thread sayısını koş,
+# HER koşudan sonra kernel şahidini oku.
+echo "max 100000"    | sudo tee /sys/fs/cgroup/lab/cpu.max   # kolon 1: limitsiz
+# (kolon 2: "100000 100000" = 1 vCPU · kolon 3: "50000 100000" = 0.5 vCPU)
+
+burners/bin/02_threads 1
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+burners/bin/02_threads 2
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+burners/bin/02_threads 8
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/lab/cpu.stat
+
+# Temizlik — tuzağıyla birlikte: shell'in hâlâ içerideyken rmdir
+# "Device or resource busy" ile reddedilir. Önce kendini tahliye et
+# (root cgroup'a geri taşın), sonra hücreyi sil:
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
+cat /proc/$$/cgroup                    # 0::/ — yeniden özgürsün
+sudo rmdir /sys/fs/cgroup/lab
+```
+
+`cpu.stat` neden kolon başına değil her koşudan sonra okunur? Sayaçlar **kümülatiftir**; suçu doğru koşuya ancak koşu-başına farklar yıkar. `nr_periods` geçen quota penceresi sayısıdır, `nr_throttled` grubun bütçesini bitirdiği için dondurulduğu pencere sayısı — Kubernetes'in Prometheus'a `container_cpu_cfs_throttled_periods_total` diye ihraç ettiği, her "pod'um yavaş" soruşturmasının bir numaralı metriği olan sayacın ta kendisi.
+
+### Sonuçlar
+
+Throughput (M iter/s):
+
+| | limitsiz | 1 vCPU | 0.5 vCPU |
+|---|---|---|---|
+| **1 thread** | 581 | 574 | 288 |
+| **2 thread** | 858 | 489 | 241 |
+| **8 thread** | 854 | 490 | 250 |
+
+Kernel şahidi (koşu başına Δ`nr_throttled` / Δ`nr_periods`):
+
+| | limitsiz | 1 vCPU | 0.5 vCPU |
+|---|---|---|---|
+| **1 thread** | 0 / 0 | **0** / 55 | 50 / 60 |
+| **2 thread** | 0 / 0 | 47 / 54 | 50 / 55 |
+| **8 thread** | 0 / 0 | 48 / 55 | 51 / 57 |
+
+*(Yan not: limitsiz kolonda `nr_periods` hiç ilerlemedi — bandwidth muhasebesi yalnız bir limit varken çalışır. Limitsiz 2-thread hücresi 858 ölçtü, §3.4'te 955'ti: t3'ün CPU credit'leri erimeye başlamıştı; `%st`'yi izle.)*
+
+### Izgaranın öğrettikleri
+
+**Satır 1 — quota tek thread'e karşı dürüsttür.** 581 → 574 → 288: 1 vCPU'da ölçülebilir maliyet yok, yarım vCPU'da tam yarısı. Ve ince mücevher: 1 vCPU'da Δ`nr_throttled` = **0** — tek bir thread fiziksel olarak birden fazla CPU işgal edemez, bütçe tavanına hiç dokunmaz. Kubernetes çevirisi: **uygulamanın kullanabileceğinden büyük limit etkisizdir** — ne fayda ne zarar.
+
+**Kolon 2 — bomba: 1 vCPU quota altında 2 thread, 1 thread'den *az* üretir (489 < 574).** Aynı bütçe, daha çok işçi, daha az iş. Mekanik: iki thread 100 ms'lik bütçeyi iki SMT kardeşinde 2× hızla yakar — ~50 ms'de biter, kalan süre donuk — ama SMT çifti koşarken yalnız ~1.65× üretir. **SMT çiftinde harcanan bir quota-milisaniyesi, tam bir CPU'da harcanandan daha az iş üretir**; donma/uyanma döngüsü de kendi vergisini ekler. Kernel doğruluyor: pencerelerin ~%87'sinde throttle. Prod bilmecesi "`limit: 1` verdik — uygulama neden tek thread'den yavaş?" işte bu hücreyle cevaplanır.
+
+**Kolon 3 — acı hücre.** Tek thread temiz yarıyı alır (288); 2 ve 8 thread ~%15 ek vergi öder (241–250) ve throttle oranını ~%90'a yapıştırır. Ama throughput *hafif* semptomdur — dar quota altındaki çok thread'in asıl hasarı donma deseni; onu §3.6 doğrudan ölçecek.
+
+**Izgaranın kanıtladığı boyutlandırma kuralı:** CPU limiti altında thread sayısını `nproc`'un iddiasına değil, **limite** eşle (⌈limit⌉ thread). Dar quota altındaki fazla thread saf kayıptır: aynı ya da daha az throughput, azami throttling.
+
+# Bölüm 4 — Async Rust: tokio ve vCPU *(yakında)*
+
+Async bölümü: tokio'nun runtime modeli (çok sayıda hafif task taşıyan az sayıda OS worker thread'i), worker pool'un `std::thread::available_parallelism()` ile nasıl boyutlandığı, o çağrının limitli bir cgroup içinde gerçekte ne raporladığı ve Bölüm 3 deneylerinin async karşılıkları — aynı quota'lar altında CPU-bound vs IO-bound task'lar. Cargo burada geri döner (tokio dış bir crate).
+
+# Bölüm 5 — Kubernetes requests & limits *(yakında)*
+
+Sentez: Bölüm 3–4'teki her iş yükü — sync thread'ler ve async task'lar — OpenShift'te pod olarak deploy edilir, deney matrisi bu kez YAML ile tekrar oynanır. kubelet'in kurduğu cgroup ağacında gezinti (`kubepods.slice/...`), `requests`/`limits`'in Bölüm 2'deki dosyalara birebir eşlenmesi, gerçek pod'larda CFS throttling gözlemi ve her request/limit kombinasyonunun her iş yükü tipi için *faydalı / zararlı / etkisiz* olarak yargılanması.
