@@ -10,6 +10,32 @@ CPU sanallaştırma ve kaynak kontrolü üzerine uygulamalı bir lab: Linux cgro
 
 Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cgroup v2); gösterilen çıktılar idealize sayılar değil, gerçek ölçümlerdir.
 
+## İçindekiler
+
+- [Bölüm 1 — Temel kavramlar](#bölüm-1--temel-kavramlar)
+  - [1.1 "CPU" denen dört katman](#11-cpu-denen-dört-katman)
+  - [1.2 Core ve SMT (Hyper-Threading)](#12-core-ve-smt-hyper-threading)
+  - [1.3 vCPU gerçekte nedir](#13-vcpu-gerçekte-nedir)
+  - [1.4 Guest OS ne görür](#14-guest-os-ne-görür)
+  - [1.5 Kubernetes'in "cpu" birimi (ön izleme)](#15-kubernetesin-cpu-birimi-ön-izleme)
+  - [1.6 Komutlar](#16-komutlar)
+  - [1.7 Gerçek bir makineyi okumak (t3.large)](#17-gerçek-bir-makineyi-okumak-t3large)
+- [Bölüm 2 — cgroup v2 elle](#bölüm-2--cgroup-v2-elle)
+  - [2.1 Kernel ile dosyalar üzerinden konuşmak](#21-kernel-ile-dosyalar-üzerinden-konuşmak)
+  - [2.2 Yerleşim: dizinler cgroup'tur](#22-yerleşim-dizinler-cgrouptur)
+  - [2.3 `subtree_control` kapısı](#23-subtree_control-kapısı)
+  - [2.4 cgroup dosyalarını okuma rehberi](#24-cgroup-dosyalarını-okuma-rehberi)
+  - [2.5 Deney 1 — `cpu.max` ile throttling](#25-deney-1--cpumax-ile-throttling)
+  - [2.6 Deney 2 — `cpu.weight`, pay](#26-deney-2--cpuweight-pay)
+  - [2.7 Deney 3 — hiyerarşi: üç perdede `tree-lab`](#27-deney-3--hiyerarşi-üç-perdede-tree-lab)
+  - [2.8 Bölüm 2'nin özeti](#28-bölüm-2nin-özeti)
+- [Bölüm 3 — Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci-devam-ediyor)
+  - [3.1 VM'de Rust toolchain kurulumu](#31-vmde-rust-toolchain-kurulumu)
+  - [3.2 İlk ölçüm — kendi kendini ölçen tek thread'lik yakıcı](#32-i̇lk-ölçüm--kendi-kendini-ölçen-tek-threadlik-yakıcı)
+  - [3.3 Sürüm 2 — temiz ölçüm, N thread](#33-sürüm-2--temiz-ölçüm-n-thread)
+  - [3.4 Thread taraması — parallelism duvarı, ölçülmüş](#34-thread-taraması--parallelism-duvarı-ölçülmüş)
+- [Bölüm 4 — Kubernetes requests & limits](#bölüm-4--kubernetes-requests--limits-yakında)
+
 ## Müfredat
 
 | # | Bölüm | Cevapladığı soru | Durum |

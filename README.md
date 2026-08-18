@@ -10,6 +10,32 @@ A hands-on lab exploring CPU virtualization and resource control: Linux cgroup v
 
 Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgroup v2) and the outputs shown are real measurements, not idealized numbers.
 
+## Table of contents
+
+- [Part 1 — CPU Fundamentals](#part-1--cpu-fundamentals)
+  - [1.1 Four layers called "CPU"](#11-four-layers-called-cpu)
+  - [1.2 Cores and SMT (Hyper-Threading)](#12-cores-and-smt-hyper-threading)
+  - [1.3 What a vCPU actually is](#13-what-a-vcpu-actually-is)
+  - [1.4 What the guest OS sees](#14-what-the-guest-os-sees)
+  - [1.5 The Kubernetes "cpu" unit (preview)](#15-the-kubernetes-cpu-unit-preview)
+  - [1.6 The commands](#16-the-commands)
+  - [1.7 Reading a real machine (t3.large)](#17-reading-a-real-machine-t3large)
+- [Part 2 — cgroup v2 by hand](#part-2--cgroup-v2-by-hand)
+  - [2.1 Talking to the kernel through files](#21-talking-to-the-kernel-through-files)
+  - [2.2 The layout: directories are cgroups](#22-the-layout-directories-are-cgroups)
+  - [2.3 The `subtree_control` gate](#23-the-subtree_control-gate)
+  - [2.4 Reading the cgroup files](#24-reading-the-cgroup-files)
+  - [2.5 Experiment 1 — throttling with `cpu.max`](#25-experiment-1--throttling-with-cpumax)
+  - [2.6 Experiment 2 — `cpu.weight`, the share](#26-experiment-2--cpuweight-the-share)
+  - [2.7 Experiment 3 — hierarchy: `tree-lab`, in three acts](#27-experiment-3--hierarchy-tree-lab-in-three-acts)
+  - [2.8 Part 2 takeaways](#28-part-2-takeaways)
+- [Part 3 — Rust load generator](#part-3--rust-load-generator-in-progress)
+  - [3.1 Setting up the Rust toolchain on the VM](#31-setting-up-the-rust-toolchain-on-the-vm)
+  - [3.2 First measurement — a self-measuring, single-thread burner](#32-first-measurement--a-self-measuring-single-thread-burner)
+  - [3.3 Version 2 — clean measurement, N threads](#33-version-2--clean-measurement-n-threads)
+  - [3.4 Thread sweep — the parallelism wall, measured](#34-thread-sweep--the-parallelism-wall-measured)
+- [Part 4 — Kubernetes requests & limits](#part-4--kubernetes-requests--limits-coming-soon)
+
 ## Curriculum
 
 | # | Part | Question it answers | Status |
