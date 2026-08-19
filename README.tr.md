@@ -29,13 +29,14 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [2.6 Deney 2 — `cpu.weight`, pay](#26-deney-2--cpuweight-pay)
   - [2.7 Deney 3 — hiyerarşi: üç perdede `tree-lab`](#27-deney-3--hiyerarşi-üç-perdede-tree-lab)
   - [2.8 Bölüm 2'nin özeti](#28-bölüm-2nin-özeti)
-- [Bölüm 3 — Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci-devam-ediyor)
+- [Bölüm 3 — Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci)
   - [3.1 VM'de Rust toolchain kurulumu](#31-vmde-rust-toolchain-kurulumu)
   - [Deney 3.2 — ilk ölçüm: saat sorunu](#deney-32--ilk-ölçüm-saat-sorunu)
   - [Deney 3.3 — temiz ölçüm, N thread](#deney-33--temiz-ölçüm-n-thread)
   - [Deney 3.4 — thread taraması: parallelism duvarı](#deney-34--thread-taraması-parallelism-duvarı)
   - [Deney 3.5 — thread × quota matrisi](#deney-35--thread--quota-matrisi)
   - [Deney 3.6 — stall'lar: matrisin göremediği acı](#deney-36--stalllar-matrisin-göremediği-acı)
+  - [Deney 3.7 — "kaç CPU var?" sorusuna kim dürüst cevap verir](#deney-37--kaç-cpu-var-sorusuna-kim-dürüst-cevap-verir)
 - [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-yakında)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 
@@ -45,7 +46,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 |---|------|------------------|-------|
 | 1 | [Temel kavramlar](#bölüm-1--temel-kavramlar) | Core, hyperthread, vCPU nedir — kim kimi zamanlar? | ✅ |
 | 2 | [cgroup v2 elle](#bölüm-2--cgroup-v2-elle) | Kernel CPU zamanını nasıl dilimler, bunu nasıl canlı izlerim? | ✅ |
-| 3 | Rust ile yük üreteci | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | 🔜 |
+| 3 | Rust ile yük üreteci | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | ✅ |
 | 4 | Async Rust (tokio) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | 🔜 |
 | 5 | Kubernetes requests/limits | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
 
@@ -94,7 +95,7 @@ Akılda tutmalık model:
 
 - `cpu: 1` = **period başına bir vCPU'luk zaman**, tahsis edilmiş bir core değil.
 - `requests` → *ağırlık* (kavga çıktığında payın); `limits` → *tavan* (quota → throttling).
-- Tuzak: pod içinde `nproc` hâlâ **node'un** vCPU sayısını basar — limit ona görünmez. Rust'ın `available_parallelism()`'inin yanıltmasının sebebi budur (Bölüm 4).
+- Tuzak: pod içinde `nproc` hâlâ **node'un** vCPU sayısını basar — limit ona görünmez. Dilin runtime'ı bu hatayı tekrarlıyor mu, düzeltiyor mu — Deney 3.7'de ölçülüyor.
 
 ## 1.6 Komutlar
 
@@ -446,7 +447,7 @@ Perde A'nın Kubernetes çevirisi bir prod klasiğidir: çok thread'li bir uygul
 
 ---
 
-# Bölüm 3 — Rust ile yük üreteci *(devam ediyor)*
+# Bölüm 3 — Rust ile yük üreteci
 
 > **Test makinesi hatırlatması** (detaylar [§1.7](#17-gerçek-bir-makineyi-okumak-t3large)'de): AWS EC2 `t3.large` — **1 physical core × 2 SMT thread = 2 vCPU**, Intel Xeon 8259CL @ 2.50 GHz, Ubuntu, cgroup v2. Bu bölümdeki her sayı bu 2 vCPU'ya görelidir.
 
@@ -958,6 +959,70 @@ Buradan düşen teşhis kuralı: **1-thread satırlarında yalnız B var — sta
 4. **Dar quota altında ise period ilacını da etkisiz bırakır.** Kısa period'un 8 thread'i de kurtaracağını tahmin etmiştik — kurtarmadı (115 → 136 ms). 10 ms'lik pencerede bütçe, 8 aç thread'in paylaştığı 5 ms'lik bir kırıntıdır; şanssız thread *iki* queue'yu birden bekler — donmaları *ve* kendi turunu — üst üste pencereler boyunca. Queue baskınsa çare period ayarı değil, **thread azaltmaktır**. (Bu lab'ın 2. yanlış tahmini; ikisinde de düzeltme, tahminden çok şey öğretti.)
 
 Kubernetes finali: "p99 patladı ama CPU %50 görünüyor"un anatomisi budur — pod yavaş değil, *kekeliyor*. Teşhis: tırmanan `container_cpu_cfs_throttled_periods_total`. Tedavi, sırasıyla: thread sayısını limite eşle, sonra period'u düşün.
+
+## Deney 3.7 — "kaç CPU var?" sorusuna kim dürüst cevap verir
+
+Her runtime, thread pool'unu sisteme "kaç CPU'm var?" diye sorarak boyutlandırır — ve Bölüm 1, container içinde bu cevabın tuzak olabileceği uyarısını ekmişti. Kimin yalan söylediğini ölçme vakti. Üç bilgi katmanı var ve her cevaplayıcı farklı bir alt kümesini okuyabilir:
+
+1. **Topoloji** — makinede kaç logical CPU var (`/proc`, sysfs).
+2. **Affinity** — bu process hangi CPU'larda *koşabilir* (`sched_getaffinity`; `taskset`/`cpuset` belirler).
+3. **cgroup quota** — process ne kadar CPU *zamanı* harcayabilir (`cpu.max`; Kubernetes limits belirler).
+
+Araç altı satır — [`burners/04_nproc.rs`](burners/04_nproc.rs), Rust std'nin resmi cevabını basar:
+
+```rust
+use std::thread;
+
+fn main() {
+    match thread::available_parallelism() {
+        Ok(n) => println!("available_parallelism: {n}"),
+        Err(e) => println!("error: {e}"),
+    }
+}
+```
+
+Dört senaryo, `nproc` ile Rust cevabı yan yana (kafes düzeni §3.5'teki gibi):
+
+```
+$ nproc                                       # ── çıplak: cgroup yok, pinleme yok
+2
+$ burners/bin/04_nproc
+available_parallelism: 2
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # ── kafeste, quota 0.5 vCPU
+$ nproc
+2
+$ burners/bin/04_nproc
+available_parallelism: 1
+
+$ echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max   # ── kafeste, quota 1.5 vCPU
+$ nproc
+2
+$ burners/bin/04_nproc
+available_parallelism: 1
+
+$ echo "max 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # ── quota yok, CPU 0'a pinli
+$ taskset -c 0 nproc
+1
+$ taskset -c 0 burners/bin/04_nproc
+available_parallelism: 1
+```
+
+### Sonuçlar
+
+| Senaryo | `nproc` | `available_parallelism()` |
+|---|---|---|
+| çıplak | 2 | 2 |
+| quota 0.5 vCPU | **2** | **1** |
+| quota 1.5 vCPU | **2** | **1** |
+| CPU 0'a pinli (`taskset`) | 1 | 1 |
+
+### Öğrettikleri
+
+1. **`nproc` affinity okur, quota asla.** 0.5 vCPU limit altında hâlâ 2 der — 64 vCPU'luk node'daki pod'a "64 CPU'n var" diyen katman budur. `nproc` ile boyutlanan her script ve program bu körlüğü miras alır.
+2. **Modern Rust std quota'yı da okur — "yalan söyler" anlatısı Rust için eskimiş.** ~1.61'den beri `available_parallelism()`, affinity'nin yanında `cpu.max`'a da bakar: 0.5 vCPU altında 1 cevabını verir. Tahminimiz "yanıltır" demişti — bu lab'ın 3. yanlış tahmini ve en mutlusu: ekosistem bu dersi çoktan almış.
+3. **1.5 vCPU sürprizi: Rust *aşağı* yuvarlar.** quota/period = 1.5 → cevap 1 (tabanı 1). Bilinçli muhafazakârlık: 1.5 CPU'luk bütçede iki işçi ikisi birden throttle yer; tek işçi temiz akar, 0.5'lik hak boşta kalır. Utilization değil latency kayırılmış.
+4. **Tuzak yalnız bazı dillerde öldü.** `nproc` tabanlı script'ler, düz C, (automaxprocs'suz) Go `GOMAXPROCS`'u, eski JVM'ler hâlâ node sayısını görür — "`limit: 2` altında 64 worker" kazası karışık dilli filolarda gerçekliğini koruyor. tokio'nun ne yaptığını Bölüm 4 *ölçecek*, varsaymayacak.
 
 # Bölüm 4 — Async Rust: tokio ve vCPU *(yakında)*
 

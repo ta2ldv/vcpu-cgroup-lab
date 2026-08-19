@@ -29,13 +29,14 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [2.6 Experiment 2 — `cpu.weight`, the share](#26-experiment-2--cpuweight-the-share)
   - [2.7 Experiment 3 — hierarchy: `tree-lab`, in three acts](#27-experiment-3--hierarchy-tree-lab-in-three-acts)
   - [2.8 Part 2 takeaways](#28-part-2-takeaways)
-- [Part 3 — Rust load generator](#part-3--rust-load-generator-in-progress)
+- [Part 3 — Rust load generator](#part-3--rust-load-generator)
   - [3.1 Setting up the Rust toolchain on the VM](#31-setting-up-the-rust-toolchain-on-the-vm)
   - [Experiment 3.2 — first measurement: the clock problem](#experiment-32--first-measurement-the-clock-problem)
   - [Experiment 3.3 — clean measurement, N threads](#experiment-33--clean-measurement-n-threads)
   - [Experiment 3.4 — thread sweep: the parallelism wall](#experiment-34--thread-sweep-the-parallelism-wall)
   - [Experiment 3.5 — the thread × quota matrix](#experiment-35--the-thread--quota-matrix)
   - [Experiment 3.6 — stalls: the pain the matrix cannot see](#experiment-36--stalls-the-pain-the-matrix-cannot-see)
+  - [Experiment 3.7 — who answers "how many CPUs?" honestly](#experiment-37--who-answers-how-many-cpus-honestly)
 - [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-coming-soon)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 
@@ -45,7 +46,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 |---|------|--------------------|--------|
 | 1 | [CPU fundamentals](#part-1--cpu-fundamentals) | What is a core, a hyperthread, a vCPU — and who schedules whom? | ✅ |
 | 2 | [cgroup v2 by hand](#part-2--cgroup-v2-by-hand) | How does the kernel slice CPU time, and how do I watch it happen? | ✅ |
-| 3 | Rust load generator | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | 🔜 |
+| 3 | Rust load generator | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | ✅ |
 | 4 | Async Rust (tokio) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | 🔜 |
 | 5 | Kubernetes requests/limits | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
 
@@ -94,7 +95,7 @@ A useful mental model:
 
 - `cpu: 1` means **one vCPU's worth of time per scheduling period**, not a dedicated core.
 - `requests` → a *weight* (your share when there is contention); `limits` → a *ceiling* (quota → throttling).
-- Trap: inside a pod, `nproc` still reports the **node's** vCPU count — limits are invisible to it. This is why Rust's `available_parallelism()` misleads (Part 4).
+- Trap: inside a pod, `nproc` still reports the **node's** vCPU count — limits are invisible to it. Whether your language runtime repeats that mistake or corrects it varies — measured in Experiment 3.7.
 
 ## 1.6 The commands
 
@@ -446,7 +447,7 @@ The Kubernetes translation of Act A is a production classic: give a multi-thread
 
 ---
 
-# Part 3 — Rust load generator *(in progress)*
+# Part 3 — Rust load generator
 
 > **Test machine reminder** (details in [§1.7](#17-reading-a-real-machine-t3large)): AWS EC2 `t3.large` — **1 physical core × 2 SMT threads = 2 vCPUs**, Intel Xeon 8259CL @ 2.50 GHz, Ubuntu, cgroup v2. Every number in this part is relative to those 2 vCPUs.
 
@@ -958,6 +959,70 @@ The diagnostic rule that falls out: **in the 1-thread rows only B exists — the
 4. **And under a tight quota, it defeats the period cure.** We predicted the short period would rescue the 8-thread case too — it did not (115 → 136 ms). With 10 ms windows, the budget is a 5 ms crumb shared by 8 hungry threads; an unlucky thread waits through *both* queues — the freezes *and* its turn — across many consecutive windows. When queueing dominates, tuning the period is not the cure; **removing threads is**. (Wrong prediction #2 for this lab; both times the correction taught more than the guess.)
 
 Kubernetes coda: this is the anatomy of "p99 exploded but CPU shows only 50 %" — the pod isn't slow, it's *stuttering*. Diagnosis: `container_cpu_cfs_throttled_periods_total` climbing. Cure, in order: match the thread count to the limit, then consider the period.
+
+## Experiment 3.7 — who answers "how many CPUs?" honestly
+
+Every runtime sizes its thread pool by asking the system "how many CPUs do I have?" — and Part 1 planted the warning that inside a container the answer can be a trap. Time to measure who lies and who doesn't. Three information layers exist, and each responder may read a different subset:
+
+1. **Topology** — how many logical CPUs the machine has (`/proc`, sysfs).
+2. **Affinity** — which CPUs this process is *allowed on* (`sched_getaffinity`; set by `taskset`/`cpuset`).
+3. **cgroup quota** — how much CPU *time* the process may spend (`cpu.max`; set by Kubernetes limits).
+
+The tool is six lines — [`burners/04_nproc.rs`](burners/04_nproc.rs), printing Rust std's official answer:
+
+```rust
+use std::thread;
+
+fn main() {
+    match thread::available_parallelism() {
+        Ok(n) => println!("available_parallelism: {n}"),
+        Err(e) => println!("error: {e}"),
+    }
+}
+```
+
+Four scenarios, `nproc` and the Rust answer side by side (cage setup as in §3.5):
+
+```
+$ nproc                                       # ── bare: no cgroup, no pinning
+2
+$ burners/bin/04_nproc
+available_parallelism: 2
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # ── caged, quota 0.5 vCPU
+$ nproc
+2
+$ burners/bin/04_nproc
+available_parallelism: 1
+
+$ echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max   # ── caged, quota 1.5 vCPU
+$ nproc
+2
+$ burners/bin/04_nproc
+available_parallelism: 1
+
+$ echo "max 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # ── no quota, pinned to CPU 0
+$ taskset -c 0 nproc
+1
+$ taskset -c 0 burners/bin/04_nproc
+available_parallelism: 1
+```
+
+### Results
+
+| Scenario | `nproc` | `available_parallelism()` |
+|---|---|---|
+| bare | 2 | 2 |
+| quota 0.5 vCPU | **2** | **1** |
+| quota 1.5 vCPU | **2** | **1** |
+| pinned to CPU 0 (`taskset`) | 1 | 1 |
+
+### What it teaches
+
+1. **`nproc` reads affinity, never quota.** Under a 0.5-vCPU limit it still says 2 — this is the layer that tells a pod on a 64-vCPU node "you have 64 CPUs". Every script and program that sizes by `nproc` inherits the blindness.
+2. **Modern Rust std reads the quota too — the "lie" narrative is outdated for Rust.** Since ~1.61, `available_parallelism()` checks `cpu.max` along with affinity: under 0.5 vCPU it answers 1. Our prediction said "it misleads" — wrong prediction #3 for this lab, and the happiest one: the ecosystem had already learned this lesson.
+3. **The 1.5-vCPU surprise: Rust rounds *down*.** quota/period = 1.5 → answer 1 (with a floor of 1). Conservative by design: two workers on 1.5 CPUs of budget would both throttle; one worker runs clean and leaves 0.5 unused. Latency is favored over utilization.
+4. **The trap is dead only in some languages.** `nproc`-based scripts, plain C, Go's `GOMAXPROCS` (without automaxprocs), older JVMs still see the node's count — the "64 workers under `limit: 2`" incident remains real in mixed-language fleets. What tokio does, Part 4 will *measure*, not assume.
 
 # Part 4 — Async Rust: tokio and the vCPU *(coming soon)*
 
