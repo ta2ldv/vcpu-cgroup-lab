@@ -35,6 +35,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 3.3 — clean measurement, N threads](#experiment-33--clean-measurement-n-threads)
   - [Experiment 3.4 — thread sweep: the parallelism wall](#experiment-34--thread-sweep-the-parallelism-wall)
   - [Experiment 3.5 — the thread × quota matrix](#experiment-35--the-thread--quota-matrix)
+  - [Experiment 3.6 — stalls: the pain the matrix cannot see](#experiment-36--stalls-the-pain-the-matrix-cannot-see)
 - [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-coming-soon)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 
@@ -841,6 +842,122 @@ Reading a cell: "47 / 54" = of the 54 quota windows that elapsed during this run
 **Column 3 — the painful cell.** One thread takes the clean half (288); 2 and 8 threads pay a further ~15 % tax (241–250) while pinning the throttle ratio to ~90 %. Throughput, however, is the *mild* symptom — the real damage of many-threads-under-tight-quota is the freeze pattern, which §3.6 measures directly.
 
 **The sizing rule this grid proves:** under a CPU limit, match the thread count to the limit (⌈limit⌉ threads), not to what `nproc` claims. Extra threads under a tight quota are pure loss: same or less throughput, maximal throttling.
+
+## Experiment 3.6 — stalls: the pain the matrix cannot see
+
+Experiment 3.5 ended with "throughput halved" — unpleasant but tolerable. What the matrix could *not* show: under a tight quota, work does not flow slower-and-evenly. It flows in bursts separated by dead freezes. For a server, those freezes are requests sitting motionless in a queue.
+
+**Why neither `top` nor throughput reveals this: both are averages.** `top` samples CPU usage over its refresh interval; our benchmark divides total work by 5 seconds. A 100 ms freeze disappears inside either average — "50 % CPU" can mean *everything runs at half speed* or *full speed half the time, dead the other half*. For throughput those are identical; for latency they are different worlds. The only observer that can tell them apart sits **inside the process**, timestamping its own progress. That is why the burner must measure its own stalls.
+
+### The tool: `03_stalls.rs`
+
+[`burners/03_stalls.rs`](burners/03_stalls.rs) is `02_threads` plus one idea: each thread remembers the **longest gap between two consecutive batch completions**. The heart of it, annotated:
+
+```rust
+fn burn(secs: u64) -> (u64, Duration) {          // now returns TWO things:
+    let start = Instant::now();                  //   (total count, worst gap)
+    let mut count: u64 = 0;
+    let mut max_stall = Duration::ZERO;          // worst gap seen so far: starts at 0
+    let mut last = Instant::now();               // timestamp of the PREVIOUS batch end
+
+    while start.elapsed() < Duration::from_secs(secs) {
+        for _ in 0..BATCH {                      // the batch: 1 M counted increments
+            count = std::hint::black_box(count + 1);
+        }
+        let now = Instant::now();                // this batch just finished
+        let gap = now - last;                    // time since the previous finish —
+        if gap > max_stall {                     //   work time AND any freeze in between
+            max_stall = gap;                     // keep only the record holder
+        }
+        last = now;                              // this finish becomes the new reference
+    }
+    (count, max_stall)
+}
+```
+
+How the measurement works, step by step: the thread lives batch to batch, like a runner clocking laps. `last` always holds the finish time of the previous lap; each new finish computes `gap` = the lap's true duration — CPU work *plus* anything that interrupted it (a quota freeze, waiting in the run queue). On an unlimited, uncontended CPU every lap is ~2 ms, so `max_stall` stays ~2 ms. If the kernel froze the group for 50 ms mid-lap, that lap's `gap` jumps to ~52 ms and `max_stall` records it. In `main`, each thread returns its own maximum and the worst across threads is printed — the longest time *any* thread stood still.
+
+One honest limitation: we keep only the *maximum*, so the output says how bad the worst moment was, not how often bad moments happened. (A real latency benchmark would keep a histogram and report p50/p99 — that refinement belongs to the tokio part.)
+
+### The runs
+
+Cage setup identical to §3.5 (shell in the cgroup, one terminal). Six runs: two thread counts (1 / 8) × three regimes — unlimited, 0.5 vCPU with the standard 100 ms period, and 0.5 vCPU with a 10 ms period (same ratio, 10× shorter windows).
+
+```bash
+rustc -O burners/03_stalls.rs -o burners/bin/03_stalls
+
+burners/bin/03_stalls 1                                      # ── unlimited
+burners/bin/03_stalls 8
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # ── 0.5 vCPU, 100 ms period
+burners/bin/03_stalls 1
+burners/bin/03_stalls 8
+echo "5000 10000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # ── 0.5 vCPU, 10 ms period
+burners/bin/03_stalls 1
+burners/bin/03_stalls 8
+```
+
+Full run (t3.large):
+
+```
+$ cat /sys/fs/cgroup/lab/cpu.max
+max 100000
+$ burners/bin/03_stalls 1
+1 thread(s): 578 M iter/s total, worst stall: 2.1 ms
+$ burners/bin/03_stalls 8
+8 thread(s): 909 M iter/s total, worst stall: 30.8 ms
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+$ burners/bin/03_stalls 1
+1 thread(s): 289 M iter/s total, worst stall: 53.3 ms
+$ burners/bin/03_stalls 8
+8 thread(s): 237 M iter/s total, worst stall: 115.1 ms
+
+$ echo "5000 10000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+$ burners/bin/03_stalls 1
+1 thread(s): 285 M iter/s total, worst stall: 7.7 ms
+$ burners/bin/03_stalls 8
+8 thread(s): 272 M iter/s total, worst stall: 135.9 ms
+```
+
+### Results
+
+| Run | M iter/s | Worst stall |
+|---|---|---|
+| unlimited, 1 thread | 578 | 2.1 ms |
+| unlimited, 8 threads | 909 | **30.8 ms** |
+| 0.5 vCPU · 100 ms period, 1 thread | 289 | 53.3 ms |
+| 0.5 vCPU · 100 ms period, 8 threads | 237 | 115.1 ms |
+| 0.5 vCPU · 10 ms period, 1 thread | 285 | **7.7 ms** |
+| 0.5 vCPU · 10 ms period, 8 threads | 272 | **135.9 ms** |
+
+### Anatomy: two sources of waiting
+
+The six numbers look erratic until you see that "stall" is not one thing. A thread that isn't running is waiting on one of **two independent mechanisms**:
+
+- **Source A — run-queue waiting.** More runnable threads than CPUs: the scheduler rotates them, and your thread waits *while others run*. Think of a barbershop: two chairs (vCPUs), eight customers (threads) — most of your visit is spent in the waiting row, not the chair.
+- **Source B — the quota freeze.** The cgroup's budget for this window is spent; the kernel stops *everyone* until the next window opens. The barbershop's shutter comes down — no one is served, no matter how short the row is.
+
+The two are independent: A needs contention (many threads), B needs a limit (quota). Each run in our table switches one, the other, or both:
+
+| Run | Stall | Diagnosis |
+|---|---|---|
+| unlimited, 1 thread | 2.1 ms | neither — just a batch's own duration |
+| unlimited, 8 threads | 30.8 ms | pure **A**: 4 threads per chair, ~3–4 turns of waiting |
+| 0.5 vCPU · 100 ms, 1 thread | 53.3 ms | pure **B**: 50 ms shutter (period − quota) + ~3 ms batch |
+| 0.5 vCPU · 100 ms, 8 threads | 115.1 ms | **A + B**: the shutter lifts — but it's still not your turn; next window, frozen again |
+| 0.5 vCPU · 10 ms, 1 thread | 7.7 ms | pure B, miniaturized: 5 ms shutter + batch |
+| 0.5 vCPU · 10 ms, 8 threads | 135.9 ms | **A × B, worst case**: each window opens for a 5 ms crumb, eight hungry threads fight for it — an unlucky thread can go whole *series* of windows without a turn |
+
+The diagnostic rule that falls out: **in the 1-thread rows only B exists — the stall is predictable by formula and shrinks with the period. In the 8-thread rows A joins in and compounds with B — the stall now belongs to the length of the queue, and no period setting can shorten a queue.** That is why the same knob (10 ms period) healed one row (53 → 7.7) and did nothing for the other (115 → 136).
+
+### What it teaches
+
+1. **The ratio sets the speed; the period does not.** 289 vs 285, 237 vs 272 — the period changed 10×, throughput didn't move. Average speed is quota ÷ period, full stop.
+2. **For a single thread, the period is the pain dial.** Worst stall ≈ (period − quota) + one batch: 53.3 ms ≈ 50 ms freeze + ~3 ms of work; shrink the period to 10 ms and the stall collapses to 7.7 ms — same throughput, 7× gentler tail latency. This is precisely kubelet's `cpuCFSQuotaPeriod` knob.
+3. **Oversubscription is a latency machine even with no limit at all.** 8 threads, unlimited: 30.8 ms worst stall — nobody was frozen; that is pure turn-waiting among 8 threads on 2 vCPUs (§3.4's friction, seen from the latency side).
+4. **And under a tight quota, it defeats the period cure.** We predicted the short period would rescue the 8-thread case too — it did not (115 → 136 ms). With 10 ms windows, the budget is a 5 ms crumb shared by 8 hungry threads; an unlucky thread waits through *both* queues — the freezes *and* its turn — across many consecutive windows. When queueing dominates, tuning the period is not the cure; **removing threads is**. (Wrong prediction #2 for this lab; both times the correction taught more than the guess.)
+
+Kubernetes coda: this is the anatomy of "p99 exploded but CPU shows only 50 %" — the pod isn't slow, it's *stuttering*. Diagnosis: `container_cpu_cfs_throttled_periods_total` climbing. Cure, in order: match the thread count to the limit, then consider the period.
 
 # Part 4 — Async Rust: tokio and the vCPU *(coming soon)*
 

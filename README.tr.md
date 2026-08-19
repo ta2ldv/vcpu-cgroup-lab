@@ -35,6 +35,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 3.3 — temiz ölçüm, N thread](#deney-33--temiz-ölçüm-n-thread)
   - [Deney 3.4 — thread taraması: parallelism duvarı](#deney-34--thread-taraması-parallelism-duvarı)
   - [Deney 3.5 — thread × quota matrisi](#deney-35--thread--quota-matrisi)
+  - [Deney 3.6 — stall'lar: matrisin göremediği acı](#deney-36--stalllar-matrisin-göremediği-acı)
 - [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-yakında)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 
@@ -316,7 +317,7 @@ Adım 3–4'ün sırası önemli değildir: limit *hücreye* aittir; içeri gire
 - Boş CPU'da weight hükümsüzdür — weight 1 bile %100 alır. Weight asla throttle etmez, `nr_throttled` artırmaz.
 - Kubernetes: `requests: cpu` → `cpu.weight`'e çevrilir. Bu deney, "requests vs limits"in kernel seviyesindeki halidir.
 
-**Tasarım problemi:** 2 vCPU'muz var. İki busy loop ayrı vCPU'lara oturur ve hiç kavga etmez — weight ise yalnızca kavgada hakemlik yapar. Kavgayı, iki cgroup'u **`cpuset.cpus`** ile CPU 0'a kilitleyerek zorluyoruz (üçüncü controller: `cpuset` = *nerede* koşabilirsin, `cpu.max` = *ne kadar*, `cpu.weight` = *kuyrukta kim kazanır*).
+**Tasarım problemi:** 2 vCPU'muz var. İki busy loop ayrı vCPU'lara oturur ve hiç kavga etmez — weight ise yalnızca kavgada hakemlik yapar. Kavgayı, iki cgroup'u **`cpuset.cpus`** ile CPU 0'a kilitleyerek zorluyoruz (üçüncü controller: `cpuset` = *nerede* koşabilirsin, `cpu.max` = *ne kadar*, `cpu.weight` = *run queue'da kim kazanır*).
 
 ```bash
 # 1. İki hücre
@@ -420,9 +421,9 @@ sudo rmdir /sys/fs/cgroup/tree-lab
 | B | + ikisi CPU 0'a kilitli | **%12.7** | **%37.3** | ~%50 |
 | C | + quota 1 vCPU'ya çıktı | **%25.0** | **%74.7** | ~%100 |
 
-**Perde A — neden 25/25, neden 25/75 değil?** 25/75 tahmin etmiştik ve yanıldık. Process'ler ayrı vCPU'lara kaçtı — ama quota'dan kaçamadılar: **quota CPU başına değil, cgroup'un toplamına yazılır**. İki CPU'da koşmak 50 ms'lik bütçeyi sadece 2× hızla yakar (25 ms'de biter), sonra *ikisi birden* donar. Ama hiç *aynı* CPU'nun kuyruğuna girmedikleri için kavga da çıkmadı — ve **weight yalnızca bir CPU'nun kuyruğundaki kavgada hakemlik yapar**. Kavga yoksa bütçe ilk-gelen-alır usulü tüketilir: eşit bölüşüm.
+**Perde A — neden 25/25, neden 25/75 değil?** 25/75 tahmin etmiştik ve yanıldık. Process'ler ayrı vCPU'lara kaçtı — ama quota'dan kaçamadılar: **quota CPU başına değil, cgroup'un toplamına yazılır**. İki CPU'da koşmak 50 ms'lik bütçeyi sadece 2× hızla yakar (25 ms'de biter), sonra *ikisi birden* donar. Ama hiç *aynı* CPU'nun run queue'suna girmedikleri için kavga da çıkmadı — ve **weight yalnızca bir CPU'nun run queue'sundaki kavgada hakemlik yapar**. Kavga yoksa bütçe ilk-gelen-alır usulü tüketilir: eşit bölüşüm.
 
-**Perde B** — aynı 50 ms'lik pasta, ama artık ikisi CPU 0'un kuyruğunda → weight hakem: 100:300 ⇒ tahmin 12.5/37.5, ölçüm 12.7/37.3.
+**Perde B** — aynı 50 ms'lik pasta, ama artık ikisi CPU 0'un run queue'sunda → weight hakem: 100:300 ⇒ tahmin 12.5/37.5, ölçüm 12.7/37.3.
 
 **Perde C** — pasta (100 ms) artık tek CPU'nun verebileceğini aşıyor (CPU 0 100 ms'de en fazla 100 ms verebilir), quota görünmez olur ve CPU'yu yalnız weight böler: 25/75.
 
@@ -696,7 +697,7 @@ Kayıp nereden geliyor? Mekaniği takip et:
 
 **Duvarın ötesinde thread'ler yardım etmeyi bırakmakla kalmaz — maliyet çıkarmaya başlar.**
 
-−%11'imizi *en iyi ihtimal* yapan incelik: bu iterasyonlar tamamen bağımsız — paylaşılan veri yok, lock yok, working set minicik. Gerçek uygulamalar durum paylaşır; thread'leri birbirinin cache line'larını söker, lock kuyruklarında bekleşir — oversubscription sürtünmesi bu temiz döngünün gösterdiğinden tipik olarak çok daha ağırdır.
+−%11'imizi *en iyi ihtimal* yapan incelik: bu iterasyonlar tamamen bağımsız — paylaşılan veri yok, lock yok, working set minicik. Gerçek uygulamalar durum paylaşır; thread'leri birbirinin cache line'larını söker, lock queue'larında bekleşir — oversubscription sürtünmesi bu temiz döngünün gösterdiğinden tipik olarak çok daha ağırdır.
 
 ### Dersler
 
@@ -841,6 +842,122 @@ Hücre okuma örneği: "47 / 54" = bu koşu sırasında geçen 54 quota penceres
 **Kolon 3 — acı hücre.** Tek thread temiz yarıyı alır (288); 2 ve 8 thread ~%15 ek vergi öder (241–250) ve throttle oranını ~%90'a yapıştırır. Ama throughput *hafif* semptomdur — dar quota altındaki çok thread'in asıl hasarı donma deseni; onu §3.6 doğrudan ölçecek.
 
 **Izgaranın kanıtladığı boyutlandırma kuralı:** CPU limiti altında thread sayısını `nproc`'un iddiasına değil, **limite** eşle (⌈limit⌉ thread). Dar quota altındaki fazla thread saf kayıptır: aynı ya da daha az throughput, azami throttling.
+
+## Deney 3.6 — stall'lar: matrisin göremediği acı
+
+Deney 3.5 "throughput yarılandı" ile bitti — nahoş ama katlanılır. Matrisin *gösteremediği* şey: dar quota altında iş yavaş-ve-düzgün akmaz. **Patlamalar halinde akar, aralarında ölü donmalar vardır.** Bir server için o donmalar, queue'da kıpırdamadan bekleyen isteklerdir.
+
+**Bunu neden ne `top` ne throughput gösterir: ikisi de ortalamadır.** `top` CPU kullanımını yenileme aralığı üzerinden örnekler; benchmark'ımız toplam işi 5 saniyeye böler. 100 ms'lik bir donma iki ortalamanın da içinde kaybolur — "%50 CPU", *her şey yarı hızda akıyor* da olabilir, *yarı zaman tam hız, yarı zaman taş kesilmiş* de. Throughput için ikisi aynıdır; latency için apayrı dünyalardır. İkisini ayırt edebilen tek gözlemci **process'in içinde** oturur ve kendi ilerleyişini zaman damgalar. Burner'ın stall'unu kendisinin ölçmesi bu yüzden şarttır.
+
+### Araç: `03_stalls.rs`
+
+[`burners/03_stalls.rs`](burners/03_stalls.rs) = `02_threads` + tek fikir: her thread, **ardışık iki batch bitişi arasındaki en uzun boşluğu** aklında tutar. Kalbi, açıklamalı:
+
+```rust
+fn burn(secs: u64) -> (u64, Duration) {          // artık İKİ şey döndürür:
+    let start = Instant::now();                  //   (toplam sayım, en kötü boşluk)
+    let mut count: u64 = 0;
+    let mut max_stall = Duration::ZERO;          // görülen en kötü boşluk: 0'dan başlar
+    let mut last = Instant::now();               // bir ÖNCEKİ batch bitişinin zaman damgası
+
+    while start.elapsed() < Duration::from_secs(secs) {
+        for _ in 0..BATCH {                      // batch: 1 M sayım
+            count = std::hint::black_box(count + 1);
+        }
+        let now = Instant::now();                // bu batch az önce bitti
+        let gap = now - last;                    // önceki bitişten bu yana geçen süre —
+        if gap > max_stall {                     //   iş süresi VE aradaki her kesinti
+            max_stall = gap;                     // yalnız rekor sahibini tut
+        }
+        last = now;                              // bu bitiş yeni referans olur
+    }
+    (count, max_stall)
+}
+```
+
+Ölçüm adım adım şöyle çalışır: thread, tur atan bir koşucu gibi batch'ten batch'e yaşar. `last` her zaman önceki turun bitiş saatini tutar; her yeni bitişte `gap` = turun gerçek süresi hesaplanır — CPU işi *artı* onu kesen her şey (quota donması, run queue'da bekleme). Limitsiz ve boş bir CPU'da her tur ~2 ms sürer, `max_stall` ~2 ms'de kalır. Kernel grubu tur ortasında 50 ms dondurduysa o turun `gap`'i ~52 ms'e fırlar ve `max_stall` bunu kayda geçirir. `main`'de her thread kendi maksimumunu döndürür, thread'ler arasındaki en kötüsü basılır — *herhangi bir* thread'in en uzun süre kıpırdamadan durduğu süre.
+
+Dürüst bir sınır: yalnız *maksimumu* tutuyoruz; çıktı en kötü anın ne kadar kötü olduğunu söyler, kötü anların ne sıklıkta olduğunu değil. (Gerçek bir latency benchmark'ı histogram tutup p50/p99 basardı — o inceltme tokio bölümüne kalsın.)
+
+### Koşular
+
+Kafes kurulumu §3.5 ile aynı (shell cgroup'ta, tek terminal). Altı koşu: iki thread sayısı (1 / 8) × üç rejim — limitsiz, 0.5 vCPU standart 100 ms period, 0.5 vCPU 10 ms period (aynı oran, 10× kısa pencere).
+
+```bash
+rustc -O burners/03_stalls.rs -o burners/bin/03_stalls
+
+burners/bin/03_stalls 1                                      # ── limitsiz
+burners/bin/03_stalls 8
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # ── 0.5 vCPU, 100 ms period
+burners/bin/03_stalls 1
+burners/bin/03_stalls 8
+echo "5000 10000" | sudo tee /sys/fs/cgroup/lab/cpu.max      # ── 0.5 vCPU, 10 ms period
+burners/bin/03_stalls 1
+burners/bin/03_stalls 8
+```
+
+Tam koşu (t3.large):
+
+```
+$ cat /sys/fs/cgroup/lab/cpu.max
+max 100000
+$ burners/bin/03_stalls 1
+1 thread(s): 578 M iter/s total, worst stall: 2.1 ms
+$ burners/bin/03_stalls 8
+8 thread(s): 909 M iter/s total, worst stall: 30.8 ms
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+$ burners/bin/03_stalls 1
+1 thread(s): 289 M iter/s total, worst stall: 53.3 ms
+$ burners/bin/03_stalls 8
+8 thread(s): 237 M iter/s total, worst stall: 115.1 ms
+
+$ echo "5000 10000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+$ burners/bin/03_stalls 1
+1 thread(s): 285 M iter/s total, worst stall: 7.7 ms
+$ burners/bin/03_stalls 8
+8 thread(s): 272 M iter/s total, worst stall: 135.9 ms
+```
+
+### Sonuçlar
+
+| Koşu | M iter/s | Worst stall |
+|---|---|---|
+| limitsiz, 1 thread | 578 | 2.1 ms |
+| limitsiz, 8 thread | 909 | **30.8 ms** |
+| 0.5 vCPU · 100 ms period, 1 thread | 289 | 53.3 ms |
+| 0.5 vCPU · 100 ms period, 8 thread | 237 | 115.1 ms |
+| 0.5 vCPU · 10 ms period, 1 thread | 285 | **7.7 ms** |
+| 0.5 vCPU · 10 ms period, 8 thread | 272 | **135.9 ms** |
+
+### Anatomi: beklemenin iki kaynağı
+
+Altı sayı, "stall"un tek bir şey olmadığını görene kadar düzensiz görünür. Koşmayan bir thread, **iki bağımsız mekanizmadan** birini bekliyordur:
+
+- **Kaynak A — run queue beklemesi.** CPU'dan çok runnable thread var: scheduler onları rotasyonla döndürür, senin thread'in *başkaları koşarken* bekler. Berber dükkânı düşün: iki koltuk (vCPU), sekiz müşteri (thread) — ziyaretinin çoğu koltukta değil, bekleme sırasında geçer.
+- **Kaynak B — quota donması.** cgroup'un bu penceredeki bütçesi bitti; kernel bir sonraki pencere açılana dek *herkesi* durdurur. Dükkânın kepengi iner — sıra ne kadar kısa olursa olsun kimseye hizmet yok.
+
+İkisi bağımsızdır: A'ya çekişme lazım (çok thread), B'ye limit lazım (quota). Tablomuzdaki her koşu birini, öbürünü ya da ikisini birden açıyor:
+
+| Koşu | Stall | Teşhis |
+|---|---|---|
+| limitsiz, 1 thread | 2.1 ms | ikisi de yok — batch'in kendi süresi |
+| limitsiz, 8 thread | 30.8 ms | saf **A**: koltuk başına 4 thread, ~3–4 tur bekleme |
+| 0.5 vCPU · 100 ms, 1 thread | 53.3 ms | saf **B**: 50 ms kepenk (period − quota) + ~3 ms batch |
+| 0.5 vCPU · 100 ms, 8 thread | 115.1 ms | **A + B**: kepenk kalkıyor — ama sıra hâlâ sende değil; sonraki pencerede yine donma |
+| 0.5 vCPU · 10 ms, 1 thread | 7.7 ms | saf B, küçültülmüş: 5 ms kepenk + batch |
+| 0.5 vCPU · 10 ms, 8 thread | 135.9 ms | **A × B, en kötü hal**: her pencere 5 ms'lik bir kırıntı için açılıyor, sekiz aç thread onu kapışıyor — şanssız thread üst üste *pencere serileri* boyunca hiç sıra alamayabilir |
+
+Buradan düşen teşhis kuralı: **1-thread satırlarında yalnız B var — stall formülle öngörülebilir ve period'la küçülür. 8-thread satırlarında A devreye girer ve B ile birleşir — stall artık queue'nun uzunluğuna aittir ve hiçbir period ayarı bir queue'yu kısaltamaz.** Aynı düğmenin (10 ms period) bir satırı iyileştirip (53 → 7.7) öbürüne hiçbir şey yapamamasının (115 → 136) sebebi budur.
+
+### Öğrettikleri
+
+1. **Oran hızı belirler; period belirlemez.** 289 vs 285, 237 vs 272 — period 10× değişti, throughput kımıldamadı. Ortalama hız = quota ÷ period, nokta.
+2. **Tek thread için period, acı düğmesidir.** Worst stall ≈ (period − quota) + bir batch: 53.3 ms ≈ 50 ms donma + ~3 ms iş; period'u 10 ms'e indir, stall 7.7 ms'e çöker — aynı throughput, 7× yumuşak tail latency'si. kubelet'in `cpuCFSQuotaPeriod` düğmesinin ta kendisi.
+3. **Oversubscription, hiç limit yokken bile bir latency makinesidir.** 8 thread, limitsiz: 30.8 ms worst stall — kimse dondurulmadı; bu, 2 vCPU'da 8 thread'in saf sıra beklemesi (§3.4'ün sürtünmesi, latency tarafından görünüşü).
+4. **Dar quota altında ise period ilacını da etkisiz bırakır.** Kısa period'un 8 thread'i de kurtaracağını tahmin etmiştik — kurtarmadı (115 → 136 ms). 10 ms'lik pencerede bütçe, 8 aç thread'in paylaştığı 5 ms'lik bir kırıntıdır; şanssız thread *iki* queue'yu birden bekler — donmaları *ve* kendi turunu — üst üste pencereler boyunca. Queue baskınsa çare period ayarı değil, **thread azaltmaktır**. (Bu lab'ın 2. yanlış tahmini; ikisinde de düzeltme, tahminden çok şey öğretti.)
+
+Kubernetes finali: "p99 patladı ama CPU %50 görünüyor"un anatomisi budur — pod yavaş değil, *kekeliyor*. Teşhis: tırmanan `container_cpu_cfs_throttled_periods_total`. Tedavi, sırasıyla: thread sayısını limite eşle, sonra period'u düşün.
 
 # Bölüm 4 — Async Rust: tokio ve vCPU *(yakında)*
 
