@@ -39,8 +39,8 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 3.7 — who answers "how many CPUs?" honestly](#experiment-37--who-answers-how-many-cpus-honestly)
 - [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-in-progress)
   - [4.1 Cargo returns — project setup](#41-cargo-returns--project-setup)
-  - [Experiment 4.2 — how many workers does tokio start?](#experiment-42--how-many-workers-does-tokio-start)
-  - [4.3 How tokio schedules — cooperative, `.await`, task queues](#43-how-tokio-schedules--cooperative-await-task-queues)
+  - [4.2 How tokio schedules — cooperative, `.await`, task queues](#42-how-tokio-schedules--cooperative-await-task-queues)
+  - [Experiment 4.3 — how many workers does tokio start?](#experiment-43--how-many-workers-does-tokio-start)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 - [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -1116,7 +1116,79 @@ tokio = { version = "1", features = ["full"] }
 
 (`features = ["full"]` enables all tokio components — runtime, net, time. Production builds pick selectively; for a lab, full is practical.) First `cargo build --release` takes a minute or two while tokio compiles; subsequent builds are seconds. The project lives at [`tokioburn/`](tokioburn/) in this repo.
 
-## Experiment 4.2 — how many workers does tokio start?
+## 4.2 How tokio schedules — cooperative, `.await`, task queues
+
+Theory first — five building blocks that everything in async Rust hangs on.
+
+### Preemptive vs cooperative
+
+The **kernel scheduler is preemptive**: a hardware timer fires an interrupt every few milliseconds; whatever a thread is doing, the kernel forcibly pauses it, saves its registers, and seats another thread. The thread is never asked. This is why 8 busy threads could share 2 vCPUs in Part 3 — an infinite loop cannot starve its neighbors, the kernel keeps taking the CPU back.
+
+The **tokio scheduler is cooperative**: the runtime cannot interrupt a running task. A task releases its worker only when it reaches a surrender point in its own code — and that point is `.await`. A task that never reaches one keeps the worker forever.
+
+> Kernel scheduler: police — pulls you over. tokio scheduler: a gentlemen's agreement — you must yield on your own.
+
+### What `.await` actually does
+
+An `async fn` does not run when called; it produces a **Future** — a pausable description of work. `.await` means: *"I need this result; if it is not ready, release the worker, and resume me here when it is."*
+
+```rust
+let n = socket.read(&mut buf).await;
+```
+
+Mechanically: if the data isn't there yet, the task is suspended *at that line* — its position and live variables are saved (the compiler turns the function into a state machine). The worker immediately picks up another task. When the data arrives, tokio marks the task ready, and some worker resumes it exactly where it stopped. `.await` is both a waiting point and **the gate where the worker is handed back** — it is the "cooperate" in cooperative scheduling.
+
+The dark side follows directly: a loop with **no** `.await` — `loop { count += 1 }` — has no gate. Running a task is, for the worker thread, just a function call; if the function never reaches an `.await`, the worker executes it without pause. tokio is a library, not a kernel: it has no timer interrupt to force the issue. (The kernel still preempts the worker *thread* — but in favor of other processes; tokio's other *tasks* stay stuck in the queues.)
+
+### The task queues and work-stealing
+
+First, how a task is born: `tokio::spawn(async { ... })` is the task-world sibling of `thread::spawn` — but it creates no OS thread. It places a lightweight task (a few hundred bytes) into the runtime's queues and returns a `JoinHandle`; some worker will run it when its turn comes.
+
+Where do ready-to-run tasks wait? In the runtime's **task queues** — tokio's counterpart of the kernel's run queue, except the entries are tasks, not threads, and the manager is tokio, not the kernel:
+
+```
+                 ┌──────────────────────────────┐
+   tokio::spawn →│  global queue (entry gate)   │
+                 └──────────────┬───────────────┘
+                                ↓ distributed
+        worker 0's local queue          worker 1's local queue
+        [task C] [task D]               [task E]
+              ↓                                ↓
+        worker 0: running task A        worker 1: running task B
+```
+
+- Each worker owns a **local queue**; newly spawned tasks and tasks that just woke up (timer fired, IO ready) land in these queues.
+- When a worker's current task suspends at an `.await`, the worker takes the next ready task **from its own local queue**.
+- If its queue is empty, it **steals from another worker's queue** — *work-stealing*, tokio's load balancer: no worker idles while another has a backlog.
+
+### The latency sensor: a heartbeat task
+
+The experiments ahead need an instrument that feels scheduling delay *from the inside*. A **heartbeat task** is exactly this much:
+
+```rust
+loop {
+    sleep(Duration::from_millis(100)).await;   // ASK to be woken 100 ms from now
+    // on waking: what time is it REALLY — how late am I?
+}
+```
+
+Everything happens on workers — tasks run nowhere else. The subtlety: during `sleep(...).await` the task does **not** sit on a worker; it is suspended, occupying nobody (the timer ticks in tokio's own agenda). When the 100 ms elapse, tokio marks the task ready, it enters a task queue — and waits for a worker. **That wait is the measurement**: planned wake-up T, actual run T+Δ. With idle workers, Δ ≈ 0; with workers held hostage by await-less tasks, Δ = the time spent in the queue. The clock is read by the task itself, on the worker, once it finally runs.
+
+### "Don't block the event loop"
+
+The number-one rule of every async runtime (Node.js, Python asyncio, tokio alike), and it follows from the three sections above: CPU-heavy or sync-blocking code inside an ordinary task occupies a worker without surrender points; every task in that worker's queue waits. tokio's guidance: between two `.await`s a task should run for roughly **10–100 µs, not more**. The classic production symptom: one endpoint does heavy parsing/compression (or a sync file read) in an async handler — and *every* connection on the server stalls at once.
+
+The escape hatch is `tokio::task::spawn_blocking(closure)`: it moves the closure to a **separate blocking-thread pool** (real OS threads, spun up on demand — up to 512 by default), where the *kernel's preemptive* scheduler manages it — while the async workers stay free for tasks that do await. In short: CPU-bound work is deported from the cooperative world back to the preemptive world, which is built for it. Note where the fault lies in the horror story above: never in `tokio::spawn` itself — in handing await-less CPU work to it.
+
+```
+wrong:  2 workers ← occupied by 2 CPU-bound tasks  → the async world is locked
+right:  2 workers ← free: heartbeats, IO, timers flow
+        + blocking pool ← the CPU work lives here, preempted fairly by the kernel
+```
+
+The experiments that follow turn every claim above into numbers.
+
+## Experiment 4.3 — how many workers does tokio start?
 
 tokio's multi-thread runtime carries many lightweight tasks on a few OS **worker threads**. The sizing of that pool is exactly where Experiment 3.7 becomes practical: does tokio follow `available_parallelism()` — and therefore see cgroup quotas — or does it read the machine? Measured, not assumed.
 
@@ -1230,65 +1302,6 @@ tokio workers: 1  (PID: 16841)
 | **no limit, only `request: 2`** | **64** |
 
 3. **The last row is the catch.** The "no limits for latency-critical services" strategy has a hidden cost: with no quota to read, the runtime falls back to the node's CPU count and starts 64 workers. On a quiet node that's free burst capacity; on a busy node, `cpu.weight` squeezes those 64 threads into a ~2-CPU share — run-queue crowding, §3.6's source-A stalls. The cure when running limitless: set the worker count explicitly (`Builder::worker_threads(n)` or the `TOKIO_WORKER_THREADS` env var), sized near your request.
-
-## 4.3 How tokio schedules — cooperative, `.await`, task queues
-
-Theory before the next experiment — four concepts that everything in async Rust hangs on.
-
-### Preemptive vs cooperative
-
-The **kernel scheduler is preemptive**: a hardware timer fires an interrupt every few milliseconds; whatever a thread is doing, the kernel forcibly pauses it, saves its registers, and seats another thread. The thread is never asked. This is why 8 busy threads could share 2 vCPUs in Part 3 — an infinite loop cannot starve its neighbors, the kernel keeps taking the CPU back.
-
-The **tokio scheduler is cooperative**: the runtime cannot interrupt a running task. A task releases its worker only when it reaches a surrender point in its own code — and that point is `.await`. A task that never reaches one keeps the worker forever.
-
-> Kernel scheduler: police — pulls you over. tokio scheduler: a gentlemen's agreement — you must yield on your own.
-
-### What `.await` actually does
-
-An `async fn` does not run when called; it produces a **Future** — a pausable description of work. `.await` means: *"I need this result; if it is not ready, release the worker, and resume me here when it is."*
-
-```rust
-let n = socket.read(&mut buf).await;
-```
-
-Mechanically: if the data isn't there yet, the task is suspended *at that line* — its position and live variables are saved (the compiler turns the function into a state machine). The worker immediately picks up another task. When the data arrives, tokio marks the task ready, and some worker resumes it exactly where it stopped. `.await` is both a waiting point and **the gate where the worker is handed back** — it is the "cooperate" in cooperative scheduling.
-
-The dark side follows directly: a loop with **no** `.await` — `loop { count += 1 }` — has no gate. Running a task is, for the worker thread, just a function call; if the function never reaches an `.await`, the worker executes it without pause. tokio is a library, not a kernel: it has no timer interrupt to force the issue. (The kernel still preempts the worker *thread* — but in favor of other processes; tokio's other *tasks* stay stuck in the queues.)
-
-### The task queues and work-stealing
-
-First, how a task is born: `tokio::spawn(async { ... })` is the task-world sibling of `thread::spawn` — but it creates no OS thread. It places a lightweight task (a few hundred bytes) into the runtime's queues and returns a `JoinHandle`; some worker will run it when its turn comes.
-
-Where do ready-to-run tasks wait? In the runtime's **task queues** — tokio's counterpart of the kernel's run queue, except the entries are tasks, not threads, and the manager is tokio, not the kernel:
-
-```
-                 ┌──────────────────────────────┐
-   tokio::spawn →│  global queue (entry gate)   │
-                 └──────────────┬───────────────┘
-                                ↓ distributed
-        worker 0's local queue          worker 1's local queue
-        [task C] [task D]               [task E]
-              ↓                                ↓
-        worker 0: running task A        worker 1: running task B
-```
-
-- Each worker owns a **local queue**; newly spawned tasks and tasks that just woke up (timer fired, IO ready) land in these queues.
-- When a worker's current task suspends at an `.await`, the worker takes the next ready task **from its own local queue**.
-- If its queue is empty, it **steals from another worker's queue** — *work-stealing*, tokio's load balancer: no worker idles while another has a backlog.
-
-### "Don't block the event loop"
-
-The number-one rule of every async runtime (Node.js, Python asyncio, tokio alike), and it follows from the three sections above: CPU-heavy or sync-blocking code inside an ordinary task occupies a worker without surrender points; every task in that worker's queue waits. tokio's guidance: between two `.await`s a task should run for roughly **10–100 µs, not more**. The classic production symptom: one endpoint does heavy parsing/compression (or a sync file read) in an async handler — and *every* connection on the server stalls at once.
-
-The escape hatch is `tokio::task::spawn_blocking(closure)`: it moves the closure to a **separate blocking-thread pool** (real OS threads, spun up on demand), where the *kernel's preemptive* scheduler manages it — while the async workers stay free for tasks that do await. In short: CPU-bound work is deported from the cooperative world back to the preemptive world, which is built for it.
-
-```
-wrong:  2 workers ← occupied by 2 CPU-bound tasks  → the async world is locked
-right:  2 workers ← free: heartbeats, IO, timers flow
-        + blocking pool ← the CPU work lives here, preempted fairly by the kernel
-```
-
-The next experiment turns every claim above into a number.
 
 [↑ Go back to TOC](#table-of-contents)
 
