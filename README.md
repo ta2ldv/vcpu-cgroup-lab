@@ -1130,7 +1130,7 @@ tokioburn/src/bin/
 
 Theory first — five building blocks that everything in async Rust hangs on.
 
-### Vocabulary: thread, worker, task
+### Vocabulary and async concepts in Rust
 
 Three words carry this whole part; fix them before anything else.
 
@@ -1148,6 +1148,53 @@ worker threads  → managed by kernel → run ON logical CPUs
 ```
 
 One sentence to keep: **a task is a work record, a worker is the thread that executes such records, and the kernel only ever sees the workers.**
+
+#### The two spawns: `tokio::spawn` vs `tokio::task::spawn_blocking`
+
+Both hand work to the runtime and both return a `JoinHandle` you `.await` — but they send the work to different places, for different kinds of work. (`tokio::spawn` is short for `tokio::task::spawn`; same module.)
+
+| | `tokio::spawn` | `tokio::task::spawn_blocking` |
+|---|---|---|
+| Accepts | a Future — `async { }` block / `async fn` call | a closure — `\|\| { }` (plain sync code) |
+| Runs it on | the **worker pool** | the **blocking pool** (separate threads, created on demand, ≤512 by default) |
+| Meant for | work that `.await`s: network, timers, channels — IO-bound | work that *cannot* `.await`: pure computation, sync IO, blocking C libraries (RocksDB!) |
+| Interruptible | cooperatively — at `.await`s only | it's a thread — the kernel preempts it |
+| Cost | ~hundreds of bytes (a task) | thread cost (pooled; cheap when warm) |
+
+Usage, side by side:
+
+```rust
+// tokio::spawn — work that awaits:
+let h = tokio::spawn(async {
+    let data = socket.read(...).await;     // releases the worker while waiting ✓
+    process_cheaply(data)                  // short CPU bits are fine (<~100 µs)
+});
+
+// spawn_blocking — work that blocks:
+let h = tokio::task::spawn_blocking(|| {
+    rocksdb_get(key)                       // blocks — but on the blocking pool, harmless
+});
+
+// results are collected the same way in both:
+let result = h.await.unwrap();
+```
+
+**The decision rule is one question:** *does this code hit an `.await` regularly while it runs?* (Remember: `.await` is not "I'm done" — it is "I must wait for something; let others use the worker meanwhile"; the task pauses, it doesn't finish.) You ask the question of the code you're about to run, not of yourself:
+
+```
+Code hits .await regularly            Code runs long with no .await
+(waits on network, timers, channels)  (pure computation, sync IO, a RocksDB call)
+        │                                     │
+        ▼                                     ▼
+   tokio::spawn                         spawn_blocking
+   (can share the workers politely —   (it will run long and uninterrupted anyway —
+    it surrenders often)                so send it to a thread whose occupation
+                                        is NOT a problem: the blocking pool)
+```
+
+The apparent contradiction is the design itself: code sent to `spawn_blocking` never awaits and runs long — **which is exactly why it goes there**. A blocking-pool thread's job is to be occupied; fairness there is the kernel's preemption. The worker pool lives by a culture of surrender — await-less code is a disaster there (4900 ms) and ordinary shift-work on the blocking pool.
+
+Two subtleties worth pocketing: **(1) wrapping doesn't fool anyone** — `tokio::spawn(async { burn(5) })` gains no `.await` from the `async` wrapper, as the experiment proves; **(2) the opposite mistake exists too** — pushing *everything* to `spawn_blocking` brings thread costs back and forfeits async's whole economy (few threads, much work). The sound architecture: IO on the workers, CPU/blocking work on the blocking pool.
 
 ### Preemptive vs cooperative
 

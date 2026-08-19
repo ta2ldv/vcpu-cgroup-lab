@@ -1130,7 +1130,7 @@ tokioburn/src/bin/
 
 Önce teori — async Rust'ta her şeyin asılı durduğu beş yapı taşı.
 
-### Vocabulary: thread, worker, task
+### Vocabulary and async concepts in Rust
 
 Bu bölümün tamamını üç kelime taşıyor; her şeyden önce onları sabitle.
 
@@ -1148,6 +1148,53 @@ worker thread'ler → kernel yönetir → logical CPU'ların ÜSTÜNDE koşar
 ```
 
 Cebe girecek cümle: **task bir iş kaydıdır, worker o kayıtları işleyen thread'dir ve kernel yalnızca worker'ları görür.**
+
+#### İki spawn: `tokio::spawn` vs `tokio::task::spawn_blocking`
+
+İkisi de runtime'a iş teslim eder ve ikisi de `.await` edilen bir `JoinHandle` döndürür — ama işi farklı yerlere, farklı iş türleri için gönderirler. (`tokio::spawn`, `tokio::task::spawn`'un kısaltmasıdır; aynı modül.)
+
+| | `tokio::spawn` | `tokio::task::spawn_blocking` |
+|---|---|---|
+| Kabul ettiği | Future — `async { }` bloğu / `async fn` çağrısı | closure — `\|\| { }` (düz sync kod) |
+| Koşturduğu yer | **worker havuzu** | **blocking havuzu** (ayrı thread'ler, gerektikçe açılır, default ≤512) |
+| Ne için | `.await` eden işler: network, timer, kanal — IO-bound | `.await` *edemeyen* işler: saf hesap, sync IO, bloke eden C kütüphaneleri (RocksDB!) |
+| Kesilebilirlik | cooperative — yalnız `.await`'lerde | thread'dir — kernel preempt eder |
+| Maliyet | ~yüzlerce byte (task) | thread maliyeti (havuzdan; sıcaksa ucuz) |
+
+Kullanım, yan yana:
+
+```rust
+// tokio::spawn — await eden iş:
+let h = tokio::spawn(async {
+    let data = socket.read(...).await;     // beklerken worker'ı bırakır ✓
+    process_cheaply(data)                  // kısa CPU parçaları sorun değil (<~100 µs)
+});
+
+// spawn_blocking — bloke eden iş:
+let h = tokio::task::spawn_blocking(|| {
+    rocksdb_get(key)                       // bloke eder — ama blocking havuzunda, zararsız
+});
+
+// sonuç iki durumda da aynı yolla toplanır:
+let result = h.await.unwrap();
+```
+
+**Karar kuralı tek soru:** *bu kod çalışırken düzenli olarak bir `.await`'e uğruyor mu?* (Hatırla: `.await` "işim bitti" değil, "beklemem gereken bir şey var — worker'ı bu arada başkası kullansın" demektir; task duraklatılır, bitmez.) Soru kendine değil, koşturacağın koda sorulur:
+
+```
+Kod düzenli .await'e uğruyor        Kod .await'siz uzun koşuyor
+(network, timer, kanal bekliyor)    (saf hesap, sync IO, RocksDB çağrısı)
+        │                                   │
+        ▼                                   ▼
+   tokio::spawn                       spawn_blocking
+   (worker'ları kibarca              (zaten uzun ve kesintisiz koşacak —
+    paylaşabilir, çünkü              o yüzden işgal edilmesi SORUN OLMAYAN
+    sık sık teslim eder)             bir thread'e, blocking havuzuna gönder)
+```
+
+Görünürdeki çelişki tasarımın kendisidir: `spawn_blocking`'e giden kod `.await` etmez ve uzun koşar — **tam da bu yüzden oraya gider**. Blocking havuzundaki thread'in görevi zaten işgal edilmektir; adaleti kernel preemption'ı sağlar. Worker havuzu ise teslim kültürüyle yaşar — `.await`'siz kod orada felakettir (4900 ms), blocking havuzunda normal mesaidir.
+
+Cebe girecek iki incelik: **(1) sarmalamak kimseyi kandırmaz** — `tokio::spawn(async { burn(5) })`, `async` ambalajından `.await` kazanmaz; deney kanıtladı. **(2) Ters yönlü hata da vardır** — *her şeyi* `spawn_blocking`'e atmak thread maliyetlerini geri getirir ve async'in bütün ekonomisini (az thread, çok iş) heba eder. Sağlam mimari: IO worker'larda, CPU/bloke işler blocking havuzunda.
 
 ### Preemptive vs cooperative
 

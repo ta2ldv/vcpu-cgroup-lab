@@ -1,0 +1,109 @@
+Tek tek, sırayla:
+
+1. Cooperative scheduling nedir?
+Task'ların CPU'yu kendi rızalarıyla geri vermesi. tokio bir task'ı çalışırken durduramaz; task ancak
+kendi kodundaki bir teslim noktasına gelince ("ben beklemedeyim" dediğinde) worker'ı bırakır. O teslim
+noktası = .await. Teslim noktasına hiç gelmeyen task, worker'da sonsuza dek kalır.
+
+2. Preemption nedir, kernel nasıl "zorla keser"?
+Preemption = zorla el koyma. Donanımda bir timer var; her birkaç ms'de bir CPU'ya interrupt atar.
+Interrupt geldiğinde çalışan kod ne yapıyor olursa olsun durdurulur, kernel devreye girer, thread'in
+register'larını kaydeder, başka thread'i oturtur. Thread'in rızası sorulmaz — sonsuz döngüdeki bir
+thread bile diğerlerini açlıktan öldüremez, kernel onu düzenli olarak indirir. Bölüm 3'te 8 thread'in
+2 vCPU'da dönüşümlü koşabilmesi bu sayedeydi.
+Fark tek cümlede: kernel scheduler'ı polis (zorla indirir), tokio scheduler'ı centilmenlik anlaşması
+(sıranı kendin vermen gerekir).
+
+3. .await nedir, nasıl çalışır?
+Async fonksiyonlar çağrılınca çalışmaz; duraklatılabilir bir iş tarifi (Future) üretir.
+.await = "bu tarifin sonucunu istiyorum; hazır değilse worker'ı serbest bırak, hazır olunca beni
+buradan devam ettir."
+
+    let n = socket.read(&mut buf).await;
+
+Mekanik olarak şu olur: veri henüz yoksa task "hazır değilim" der ve fonksiyon o noktada askıya
+alınır — kaldığı yer (hangi satır, hangi değişkenler) bir state machine olarak saklanır. Worker
+anında kuyruktan başka task alır. Veri gelince tokio task'ı "hazır" işaretler, bir worker onu
+kaldığı satırdan devam ettirir. Yani .await hem bekleme noktası hem de worker'ın teslim kapısıdır —
+cooperative sistemin "cooperate" ettiği yer tam burası.
+
+4. .await'siz döngü worker'ı nasıl rehin tutar?
+Worker, task'ı çalıştırmak = task'ın fonksiyonunu düz fonksiyon çağrısı gibi koşturmak. Teslim ancak
+.await'te olur dedik; loop { count += 1 } içinde hiç .await yok → fonksiyondan hiç çıkılmıyor → o
+worker thread'i 5 saniye boyunca sadece bu döngüyü işliyor. tokio'nun onu kesecek bir timer'ı,
+interrupt'ı yok — runtime kernel değil, sıradan bir kütüphane. (Kernel bu worker thread'ini preempt
+eder tabii — ama başka process/thread lehine; tokio'nun diğer task'ları o worker'ın kuyruğunda
+beklemeye devam eder.)
+
+5. "Don't block the event loop" gerçek mi?
+Gerçek ve evrensel — Node.js, Python asyncio, tokio: hepsinin bir numaralı kuralı. tokio
+dokümantasyonu açıkça der: bir task iki .await arasında ~10-100 µs'den uzun çalışmamalı.
+Production'daki klasik vaka: async HTTP handler'ın içine biri CPU-ağır bir işlem (JSON parse'ı
+büyük, şifreleme, sıkıştırma) ya da sync IO (düz dosya okuma, std::thread::sleep) koyar → o worker
+kilitlenir → sunucudaki alakasız tüm bağlantılar aynı anda yavaşlar. "Bir endpoint'e istek attık,
+bütün API durdu" bug'ının anatomisi budur. Deney B'de bunu kendi gözünle göreceksin.
+
+6. Heartbeat task nedir, ölçüm nerede oluyor?
+Şu kadarcık bir task:
+
+    loop {
+        sleep(Duration::from_millis(100)).await;   // 100 ms sonra uyandırılmayı İSTE
+        // uyandığında: "gerçekte saat kaç?" — planlanandan ne kadar geç kaldım?
+    }
+
+Sorularına net cevap: her şey worker'ın içinde olur — task'lar yalnız worker'larda çalışır, başka
+yer yok. Ama incelik şu: sleep(...).await sırasında task worker'da oturmuyor; askıda, kimseyi işgal
+etmiyor (timer tokio'nun ajandasında). 100 ms dolunca tokio "bu task hazır" der ve task bir worker'a
+sıra gelmesini bekler. İşte ölçtüğümüz o bekleme: planlanan uyanma T, gerçekleşen T+Δ; Δ = "runtime
+bana ne kadar geç sıra verdi". Worker'lar boşsa Δ ≈ 0; worker'lar burn task'larca rehin alınmışsa
+Δ = rehinenin süresi. Saate bakma işi, task nihayet koştuğu anda, worker üstünde olur.
+
+7. Burn task neden suçlu, tokio::spawn nedir?
+tokio::spawn(async { ... }) = runtime'a task teslim etmek — thread::spawn'un task versiyonu: OS
+thread açmaz, kuyruğa hafif bir iş koyar (maliyeti ~yüzlerce byte), worker'lardan biri sırası
+gelince koşturur, sana yine bir JoinHandle verir. Burn task "suçlu" çünkü içeriği %100 hesap, sıfır
+.await → 4. maddedeki rehin alma senaryosunun faili. Suç tokio::spawn'da değil, .await'siz CPU
+işini spawn'a vermekte.
+
+8. Sıra ve spawn_blocking'in çözümü:
+Evet: önce yanlış (B: tokio::spawn ile burn), sonra doğru (C: spawn_blocking ile burn).
+spawn_blocking(closure) işi worker havuzuna değil, ayrı bir blocking thread havuzuna verir — tokio
+bunun için gerektiğinde yeni OS thread'leri açar (default'ta 512'ye kadar). Çözümün özü:
+
+    B (yanlış):  2 worker  ←  2 burn task oturur  →  async dünya kilitli
+    C (doğru):   2 worker  ←  boş, heartbeat/IO akar
+                 +2 blocking thread  ←  burn işleri burada, kernel preemption'ı yönetir
+
+Yani spawn_blocking sorunu cooperative dünyadan preemptive dünyaya taşıyarak çözer: CPU işi artık
+sıradan OS thread'lerinde — kernel onları zorla zamanlayabilir, worker'larla adil paylaştırır;
+async task'lar worker'larında akmaya devam eder. (Bedeli: o işler artık thread maliyeti öder —
+zaten CPU-bound işin doğru yeri orası.)
+
+────────────────────────────────────────────────────────────────────────
+
+Hangi kuyruk: tokio'nun task queue'su — runtime'ın "koşmaya hazır ama şu an bir worker'da oturmayan
+task'lar" listesi. Kernel'deki run queue'nun (thread sırası) tokio içindeki karşılığı; ama bu sefer
+sıradakiler thread değil task, yöneten kernel değil tokio.
+
+Yapı somut olarak şöyle:
+
+                     ┌──────────────────────────────┐
+       tokio::spawn →│  global queue (giriş kapısı) │
+                     └──────────────┬───────────────┘
+                                    ↓ dağıtılır
+            worker 0'ın local queue'su      worker 1'in local queue'su
+            [task C] [task D]               [task E]
+                  ↓                                ↓
+            worker 0: task A koşuyor        worker 1: task B koşuyor
+
+- Her worker'ın kendi local queue'su var; tokio::spawn ile gelen ya da uyanan (timer'ı dolan,
+  IO'su hazır olan) task'lar bu kuyruklara girer.
+- Worker, elindeki task .await'e gelip askıya alınınca kendi local queue'sundan sıradaki task'ı alır.
+- Kendi kuyruğu boşsa başka worker'ın kuyruğundan çalar — buna work-stealing denir; tokio'nun
+  dengeleme mekanizması (boş worker durmaz, dolu worker'ın yükünü alır).
+
+Cümlenin düzeltilmiş hâli: "Worker anında kendi task queue'sundan (boşsa diğer worker'larınkinden
+çalarak) sıradaki hazır task'ı alır."
+
+Heartbeat'in Δ'sının tam adresi de netleşmiş oldu: uyanan heartbeat bu kuyruğa girer; worker'lar
+burn task'larca rehin alınmışsa kuyrukta bekler — Δ, kuyrukta geçen süredir.
