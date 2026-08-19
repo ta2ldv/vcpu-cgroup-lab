@@ -42,6 +42,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [4.2 How tokio schedules — cooperative, `.await`, task queues](#42-how-tokio-schedules--cooperative-await-task-queues)
   - [Experiment 4.3 — how many workers does tokio start?](#experiment-43--how-many-workers-does-tokio-start)
   - [Experiment 4.4 — blocking the event loop, measured](#experiment-44--blocking-the-event-loop-measured)
+  - [Experiment 4.5 — a million waiting tasks on two threads](#experiment-45--a-million-waiting-tasks-on-two-threads)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 - [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -1527,6 +1528,109 @@ All four ways, side by side (02 re-run the same day: control 2.7, spawn 4900.8, 
 2. **The surprise: `yield_now` (5.4) is worse for the neighbor than `sleep` (2.7) — nothing is free.** Sleepy burns rest 1 ms every cycle, so the workers are often idle at the moment the heartbeat wakes — it seats instantly. `yield_now` burns never rest: the workers stay 100 % occupied and the waking heartbeat always waits out the current batch. `sleep` buys neighbor latency with its own throughput (~33 % tax); `yield_now` keeps its throughput and bills a couple of ms to the neighbors. Pick by what the service must protect.
 
 Practical hierarchy stands: **chunkable short CPU work → yield (or micro-sleep) per chunk; long, foreign, or sync work (RocksDB) → `spawn_blocking`** — you cannot sprinkle `.await`s into a C library's code.
+
+### Problem → approach → options (4.4)
+
+**The real-world problem this maps to:** a service's p99 explodes, or the whole API freezes for seconds at a time — typically correlated with one particular endpoint or job. Signature symptoms: *all* requests stall simultaneously (not just the heavy one); overall CPU may even look low while one or two cores are pegged.
+
+**How to approach it:** suspect await-less stretches on the worker pool. Confirm before fixing: a heartbeat probe like this experiment's (or tokio-console / runtime metrics in production) shows scheduling delay; `top -H` shows which threads are pegged — if it's the `tokio-rt-worker`s while traffic stalls, the diagnosis is made.
+
+**The options, ranked:**
+
+| Option | When | Cost |
+|---|---|---|
+| `spawn_blocking` | long, sync, or foreign code (RocksDB, compression libs, big file IO) | thread-pool usage; result comes back via `.await` |
+| chunk + `yield_now()` | CPU work you own and can split into short pieces | a couple of ms neighbor latency per chunk; code discipline |
+| chunk + micro-`sleep` | same, when you'd rather idle the workers between chunks | self-throughput tax (~33 % in our numbers) |
+| dedicated compute pool (e.g. rayon) + channel | heavy, sustained, parallel computation | architecture complexity — right for compute-centric services |
+| ~~more workers~~ | never as the fix | more lanes that the same code will clog |
+
+## Experiment 4.5 — a million waiting tasks on two threads
+
+Experiment 4.4 showed async's weak flank (non-awaiting work). This one measures its reason to exist: **how many *waiting* tasks can two worker threads carry?** The probe is the heartbeat pattern multiplied: N tasks, each waking every 100 ms for 50 rounds, each tracking its own worst wake-up delay; `main` reports the worst across all of them. `sleep` here is the lab model of a network wait — both mean "suspended, occupying nobody, wake me on an event." N waiting tasks ≈ N idle connections on a server.
+
+The probe is [`tokioburn/src/bin/05_ioload.rs`](tokioburn/src/bin/05_ioload.rs):
+
+```rust
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+#[tokio::main]
+async fn main() {
+    let tasks: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(1000);
+    println!("PID: {}", std::process::id());
+
+    let start = Instant::now();
+    let handles: Vec<_> = (0..tasks).map(|_| tokio::spawn(async {
+        let mut worst = Duration::ZERO;
+        for _ in 0..50 {                                  // each task = a 50-round heartbeat
+            let planned = Instant::now() + Duration::from_millis(100);
+            sleep(Duration::from_millis(100)).await;
+            let delta = planned.elapsed();
+            if delta > worst { worst = delta; }
+        }
+        worst
+    })).collect();
+
+    let mut worst_all = Duration::ZERO;                   // worst across ALL tasks
+    for h in handles {
+        let w = h.await.unwrap();
+        if w > worst_all { worst_all = w; }
+    }
+    println!("{tasks} task(s): finished in {:.2} s, worst wake-up delay: {:.1} ms",
+             start.elapsed().as_secs_f64(),
+             worst_all.as_secs_f64() * 1000.0);
+}
+```
+
+Runs (bare EC2), with `ps -T -p <PID>` from a second terminal during each:
+
+```
+$ ./target/release/05_ioload 1000
+1000 task(s): finished in 5.07 s, worst wake-up delay: 2.6 ms
+$ ./target/release/05_ioload 10000
+10000 task(s): finished in 5.09 s, worst wake-up delay: 4.4 ms
+$ ./target/release/05_ioload 100000
+100000 task(s): finished in 5.43 s, worst wake-up delay: 32.1 ms
+$ ./target/release/05_ioload 1000000
+1000000 task(s): finished in 42.39 s, worst wake-up delay: 1067.6 ms
+
+$ ps -T -p <PID>          # identical at every scale:
+  05_ioload
+  tokio-rt-worker
+  tokio-rt-worker          ← 3 threads total, whether 1 000 or 1 000 000 tasks
+```
+
+### Results
+
+| Tasks | Duration | Worst wake-up delay | OS threads | Wake-ups needed/s |
+|---|---|---|---|---|
+| 1 000 | 5.07 s | 2.6 ms | **3** | 10 k |
+| 10 000 | 5.09 s | 4.4 ms | **3** | 100 k |
+| 100 000 | 5.43 s | 32.1 ms | **3** | 1 M |
+| 1 000 000 | **42.39 s** | **1067.6 ms** | **3** | 10 M — past the ceiling |
+
+### What it teaches
+
+1. **The async economy, proven.** 100 000 concurrently waiting jobs on 2 worker threads, worst wake-up 32 ms. As OS threads this would be ~100 000 stacks (hundreds of GB of address space, kernel run-queue chaos); here the external witness never counted past 3 threads. This is why network servers are written async: waiting is nearly free.
+2. **Nearly free — not infinitely free.** Each task wakes 10×/s, so 1 M tasks demand **10 million wake-ups per second** — and every wake-up costs the workers a few µs of bookkeeping (timer pop, queue push, poll). That bill exceeded 2 vCPUs: the run stretched 5 s → 42 s and the worst delay hit a full second. The ceiling for *waiting* concurrency is ~1000× higher than for threads, but it is still priced in the same currency: **CPU time**. Every layer of this lab ends at the same resource.
+3. **Sizing corollary:** "how many connections can this pod hold?" is not a memory question first — it is a *wake-rate* question: events/second × cost-per-event vs the pod's CPU limit. That formula carries straight into Part 6.
+
+### Problem → approach → options (4.5)
+
+**The real-world problem this maps to:** capacity planning for connection-heavy services — "can this pod hold 100 k websockets / MQTT clients / idle keep-alive connections?" And its failure mode: a service that was fine at 50 k connections collapses at 500 k with soaring latency, while memory looks healthy — because the bottleneck was never memory.
+
+**How to approach it:** budget in *events per second*, not connections: `connections × wake-ups per connection per second × CPU cost per wake-up` must fit inside the pod's CPU allowance. Measure the per-event cost with a model like this probe rather than guessing it.
+
+**The options, ranked:**
+
+| Option | Effect |
+|---|---|
+| lower per-connection wake frequency (longer heartbeat/keep-alive intervals) | divides the event rate directly — usually the cheapest win |
+| batch events (one timer serving many connections, coalesced writes) | cuts bookkeeping cost per logical event |
+| scale the CPU limit with event rate | honest but costs money; the formula says how much |
+| shard connections across pods | horizontal version of the same formula |
+| ~~add RAM~~ | not the bottleneck for waiting tasks — measure before buying |
 
 [↑ Go back to TOC](#table-of-contents)
 

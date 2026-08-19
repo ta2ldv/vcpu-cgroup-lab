@@ -42,6 +42,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [4.2 tokio nasıl zamanlar — cooperative, `.await`, task queue'lar](#42-tokio-nasıl-zamanlar--cooperative-await-task-queuelar)
   - [Deney 4.3 — tokio kaç worker açar?](#deney-43--tokio-kaç-worker-açar)
   - [Deney 4.4 — event loop'u bloke etmek, ölçülmüş](#deney-44--event-loopu-bloke-etmek-ölçülmüş)
+  - [Deney 4.5 — iki thread üstünde bir milyon bekleyen task](#deney-45--iki-thread-üstünde-bir-milyon-bekleyen-task)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 - [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -1527,6 +1528,109 @@ Dört yol yan yana (02 aynı gün yeniden koşuldu: kontrol 2.7, spawn 4900.8, b
 2. **Sürpriz: `yield_now` (5.4) komşu için `sleep`'ten (2.7) daha kötü — hiçbir şey bedava değil.** Uykulu burn'ler her turda 1 ms dinlenir; heartbeat uyandığı anda worker'lar çoğu kez boştur — anında oturur. `yield_now` burn'leri hiç dinlenmez: worker'lar %100 dolu kalır ve uyanan heartbeat hep mevcut batch'in bitmesini bekler. `sleep`, komşu latency'sini kendi throughput'uyla satın alır (~%33 vergi); `yield_now` throughput'unu korur ve komşulara birkaç ms fatura eder. Servisin neyi koruması gerekiyorsa ona göre seç.
 
 Pratik hiyerarşi geçerli: **parçalanabilir kısa CPU işi → chunk başına yield (ya da mikro-sleep); uzun, yabancı ya da sync iş (RocksDB) → `spawn_blocking`** — bir C kütüphanesinin koduna `.await` serpiştiremezsin.
+
+### Problem → yaklaşım → seçenekler (4.4)
+
+**Karşılık geldiği gerçek dünya problemi:** bir servisin p99'u patlıyor ya da bütün API saniyelerce donuyor — tipik olarak belirli bir endpoint/job ile korelasyonlu. İmza belirtiler: *tüm* istekler aynı anda takılır (yalnız ağır olan değil); toplam CPU düşük bile görünebilirken bir-iki core sonuna kadar doludur.
+
+**Nasıl yaklaşılır:** worker havuzunda `.await`'siz uzun koşulardan şüphelen. Düzeltmeden önce doğrula: bu deneydeki gibi bir heartbeat sondu (production'da tokio-console / runtime metrikleri) zamanlama gecikmesini gösterir; `top -H` hangi thread'lerin dolu olduğunu söyler — trafik takılırken dolu olanlar `tokio-rt-worker`'larsa teşhis konmuştur.
+
+**Seçenekler, sıralı:**
+
+| Seçenek | Ne zaman | Bedel |
+|---|---|---|
+| `spawn_blocking` | uzun, sync ya da yabancı kod (RocksDB, sıkıştırma kütüphaneleri, büyük dosya IO) | thread havuzu kullanımı; sonuç `.await` ile döner |
+| chunk + `yield_now()` | sahibi olduğun, kısa parçalara bölünebilir CPU işi | chunk başına komşuya birkaç ms; kod disiplini |
+| chunk + mikro-`sleep` | aynısı, chunk'lar arasında worker'ları boşaltmak istiyorsan | öz-throughput vergisi (bizim sayılarda ~%33) |
+| ayrı hesap havuzu (örn. rayon) + kanal | ağır, sürekli, paralel hesap | mimari karmaşıklık — hesap-merkezli servisler için doğru |
+| ~~worker artırmak~~ | asla çare olarak değil | aynı kodun tıkayacağı daha çok şerit |
+
+## Deney 4.5 — iki thread üstünde bir milyon bekleyen task
+
+Deney 4.4 async'in zayıf karnını gösterdi (await etmeyen iş). Bu deney var oluş sebebini ölçüyor: **iki worker thread, kaç *bekleyen* task taşıyabilir?** Sond, heartbeat kalıbının çoğaltılmışı: N task, her biri 100 ms'de bir uyanıyor (50 tur), her biri kendi en kötü uyanma gecikmesini tutuyor; `main` hepsinin en kötüsünü raporluyor. Buradaki `sleep`, network beklemesinin laboratuvar modelidir — ikisi de "askıdayım, kimseyi işgal etmiyorum, olay gelince uyandır" demektir. N bekleyen task ≈ bir server'daki N boştaki bağlantı.
+
+Sond: [`tokioburn/src/bin/05_ioload.rs`](tokioburn/src/bin/05_ioload.rs):
+
+```rust
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+#[tokio::main]
+async fn main() {
+    let tasks: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(1000);
+    println!("PID: {}", std::process::id());
+
+    let start = Instant::now();
+    let handles: Vec<_> = (0..tasks).map(|_| tokio::spawn(async {
+        let mut worst = Duration::ZERO;
+        for _ in 0..50 {                                  // her task = 50 turlu bir heartbeat
+            let planned = Instant::now() + Duration::from_millis(100);
+            sleep(Duration::from_millis(100)).await;
+            let delta = planned.elapsed();
+            if delta > worst { worst = delta; }
+        }
+        worst
+    })).collect();
+
+    let mut worst_all = Duration::ZERO;                   // TÜM task'ların en kötüsü
+    for h in handles {
+        let w = h.await.unwrap();
+        if w > worst_all { worst_all = w; }
+    }
+    println!("{tasks} task(s): finished in {:.2} s, worst wake-up delay: {:.1} ms",
+             start.elapsed().as_secs_f64(),
+             worst_all.as_secs_f64() * 1000.0);
+}
+```
+
+Koşular (çıplak EC2), her biri sırasında ikinci terminalden `ps -T -p <PID>`:
+
+```
+$ ./target/release/05_ioload 1000
+1000 task(s): finished in 5.07 s, worst wake-up delay: 2.6 ms
+$ ./target/release/05_ioload 10000
+10000 task(s): finished in 5.09 s, worst wake-up delay: 4.4 ms
+$ ./target/release/05_ioload 100000
+100000 task(s): finished in 5.43 s, worst wake-up delay: 32.1 ms
+$ ./target/release/05_ioload 1000000
+1000000 task(s): finished in 42.39 s, worst wake-up delay: 1067.6 ms
+
+$ ps -T -p <PID>          # her ölçekte birebir aynı:
+  05_ioload
+  tokio-rt-worker
+  tokio-rt-worker          ← toplam 3 thread — 1.000 task'ta da 1.000.000'da da
+```
+
+### Sonuçlar
+
+| Task | Süre | En kötü uyanma gecikmesi | OS thread | Gereken uyanma/sn |
+|---|---|---|---|---|
+| 1.000 | 5.07 s | 2.6 ms | **3** | 10 bin |
+| 10.000 | 5.09 s | 4.4 ms | **3** | 100 bin |
+| 100.000 | 5.43 s | 32.1 ms | **3** | 1 milyon |
+| 1.000.000 | **42.39 s** | **1067.6 ms** | **3** | 10 milyon — tavanın ötesi |
+
+### Öğrettikleri
+
+1. **Async ekonomisi, kanıtlandı.** 100.000 eşzamanlı bekleyen iş, 2 worker thread'de, en kötü uyanma 32 ms. OS thread olarak bu ~100.000 stack demekti (yüzlerce GB adres alanı, kernel run queue kaosu); burada dış şahit hiçbir ölçekte 3 thread'den fazlasını saymadı. Network server'ların async yazılmasının sebebi: **beklemek neredeyse bedava.**
+2. **Neredeyse bedava — sonsuz bedava değil.** Her task saniyede 10 kez uyanıyor; 1 M task = saniyede **10 milyon uyanma** talebi — ve her uyanma worker'lara birkaç µs'lik muhasebe (timer, queue, poll) ödetir. O fatura 2 vCPU'yu aştı: koşu 5 s → 42 s'ye uzadı, en kötü gecikme 1 saniyeyi buldu. *Bekleyen* concurrency'nin tavanı thread'lerinkinden ~1000× yüksek, ama para birimi aynı: **CPU zamanı.** Bu lab'ın her katmanı aynı kaynakta bitiyor.
+3. **Boyutlandırma çıkarımı:** "bu pod kaç bağlantı taşır?" önce bir memory sorusu değil, bir **uyanma-hızı** sorusudur: olay/saniye × olay başına maliyet vs pod'un CPU limiti. Bu formül doğruca Part 6'ya taşınacak.
+
+### Problem → yaklaşım → seçenekler (4.5)
+
+**Karşılık geldiği gerçek dünya problemi:** bağlantı-ağır servislerde kapasite planlama — "bu pod 100 bin websocket / MQTT client / boşta keep-alive bağlantısı taşır mı?" Ve klasik arıza biçimi: 50 bin bağlantıda sorunsuz servis 500 binde latency patlamasıyla çöker, memory tertemiz görünürken — çünkü darboğaz hiçbir zaman memory değildi.
+
+**Nasıl yaklaşılır:** bütçeyi bağlantıyla değil *saniyedeki olayla* yap: `bağlantı × bağlantı başına uyanma/sn × uyanma başına CPU maliyeti`, pod'un CPU hakkına sığmalı. Olay başına maliyeti tahmin etme — bu sonda benzeri bir modelle **ölç**.
+
+**Seçenekler, sıralı:**
+
+| Seçenek | Etkisi |
+|---|---|
+| bağlantı başına uyanma sıklığını düşür (daha uzun heartbeat/keep-alive aralıkları) | olay hızını doğrudan böler — genelde en ucuz kazanç |
+| olayları batch'le (çok bağlantıya tek timer, birleştirilmiş yazmalar) | mantıksal olay başına muhasebe maliyetini kırpar |
+| CPU limitini olay hızıyla ölçekle | dürüst ama para; formül ne kadar olduğunu söyler |
+| bağlantıları pod'lara shard'la | aynı formülün yatay versiyonu |
+| ~~RAM ekle~~ | bekleyen task'lar için darboğaz o değil — satın almadan önce ölç |
 
 [↑ Go back to TOC](#i̇çindekiler)
 
