@@ -40,6 +40,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 - [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-devam-ediyor)
   - [4.1 Cargo'nun dönüşü — proje kurulumu](#41-cargonun-dönüşü--proje-kurulumu)
   - [Deney 4.2 — tokio kaç worker açar?](#deney-42--tokio-kaç-worker-açar)
+  - [4.3 tokio nasıl zamanlar — cooperative, `.await`, task queue'lar](#43-tokio-nasıl-zamanlar--cooperative-await-task-queuelar)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 - [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -1229,6 +1230,65 @@ tokio workers: 1  (PID: 16841)
 | **limit yok, sadece `request: 2`** | **64** |
 
 3. **Yakalayıcı satır sonuncusu.** "Latency-kritik servise limit koyma" stratejisinin gizli maliyeti: okunacak quota yoksa runtime node'un CPU sayısına düşer ve 64 worker açar. Sakin node'da bu bedava burst kapasitesidir; kalabalık node'da `cpu.weight` o 64 thread'i ~2 CPU'luk paya sıkıştırır — run queue kalabalığı, §3.6'nın A-kaynağı stall'ları. Limitsiz koşarken çare: worker sayısını elle ver (`Builder::worker_threads(n)` ya da `TOKIO_WORKER_THREADS` env var), request'ine yakın boyutlandır.
+
+## 4.3 tokio nasıl zamanlar — cooperative, `.await`, task queue'lar
+
+Sıradaki deneyden önce teori — async Rust'ta her şeyin asılı durduğu dört kavram.
+
+### Preemptive vs cooperative
+
+**Kernel scheduler'ı preemptive'dir**: donanımdaki bir timer birkaç ms'de bir interrupt atar; thread ne yapıyor olursa olsun kernel onu zorla durdurur, register'larını kaydeder, başka thread'i oturtur. Thread'e sorulmaz. Bölüm 3'te 8 aç thread'in 2 vCPU'yu paylaşabilmesi bundandı — sonsuz döngü bile komşularını açlıktan öldüremez; kernel CPU'yu düzenli olarak geri alır.
+
+**tokio scheduler'ı cooperative'dir**: runtime, koşan bir task'ı kesemez. Task, worker'ı ancak kendi kodundaki bir teslim noktasına gelince bırakır — o nokta da `.await`'tir. Teslim noktasına hiç gelmeyen task, worker'ı sonsuza dek tutar.
+
+> Kernel scheduler'ı: polis — seni zorla kenara çeker. tokio scheduler'ı: centilmenlik anlaşması — yolu kendin vermelisin.
+
+### `.await` gerçekte ne yapar
+
+Bir `async fn` çağrılınca çalışmaz; bir **Future** üretir — duraklatılabilir bir iş tarifi. `.await` şu demektir: *"Bu sonucu istiyorum; hazır değilse worker'ı serbest bırak, hazır olunca beni buradan devam ettir."*
+
+```rust
+let n = socket.read(&mut buf).await;
+```
+
+Mekanik: veri henüz yoksa task *o satırda* askıya alınır — konumu ve canlı değişkenleri saklanır (derleyici fonksiyonu bir state machine'e çevirir). Worker anında başka bir task alır. Veri gelince tokio task'ı hazır işaretler; bir worker onu tam kaldığı yerden sürdürür. `.await` hem bekleme noktası hem **worker'ın geri teslim edildiği kapıdır** — cooperative'deki "cooperate" tam burasıdır.
+
+Karanlık taraf doğrudan bundan çıkar: içinde **hiç** `.await` olmayan döngünün — `loop { count += 1 }` — kapısı yoktur. Task çalıştırmak, worker thread'i için düz bir fonksiyon çağrısıdır; fonksiyon `.await`'e hiç gelmiyorsa worker onu durmaksızın işler. tokio kernel değil kütüphanedir: araya girecek timer interrupt'ı yoktur. (Kernel, worker *thread'ini* elbette preempt eder — ama başka process'ler lehine; tokio'nun diğer *task'ları* queue'larda beklemeye devam eder.)
+
+### Task queue'lar ve work-stealing
+
+Önce task'ın doğuşu: `tokio::spawn(async { ... })`, `thread::spawn`'un task dünyasındaki kardeşidir — ama OS thread'i açmaz. Runtime'ın queue'larına hafif bir task (birkaç yüz byte) bırakır ve bir `JoinHandle` döndürür; sırası gelince bir worker onu koşturur.
+
+Koşmaya hazır task'lar nerede bekler? Runtime'ın **task queue'larında** — kernel'in run queue'sunun tokio içindeki karşılığı; şu farkla: sıradakiler thread değil task, yöneten kernel değil tokio:
+
+```
+                 ┌──────────────────────────────┐
+   tokio::spawn →│  global queue (giriş kapısı) │
+                 └──────────────┬───────────────┘
+                                ↓ dağıtılır
+        worker 0'ın local queue'su      worker 1'in local queue'su
+        [task C] [task D]               [task E]
+              ↓                                ↓
+        worker 0: task A koşuyor        worker 1: task B koşuyor
+```
+
+- Her worker'ın kendi **local queue**'su vardır; yeni spawn edilen ve az önce uyanan (timer'ı dolan, IO'su hazır olan) task'lar bu queue'lara düşer.
+- Worker'ın elindeki task `.await`'te askıya alınınca worker sıradaki hazır task'ı **kendi local queue'sundan** alır.
+- Kendi queue'su boşsa **başka worker'ınkinden çalar** — *work-stealing*, tokio'nun yük dengeleyicisi: birinin birikmişi varken kimse boş durmaz.
+
+### "Don't block the event loop"
+
+Her async runtime'ın (Node.js, Python asyncio, tokio) bir numaralı kuralı — ve yukarıdaki üç bölümden doğrudan çıkar: sıradan bir task'ın içindeki CPU-ağır ya da sync-bloke eden kod, worker'ı teslim noktasız işgal eder; o worker'ın queue'sundaki her task bekler. tokio'nun rehberi: iki `.await` arasında bir task kabaca **10–100 µs'den uzun** çalışmamalı. Klasik production belirtisi: bir endpoint async handler içinde ağır parse/sıkıştırma (ya da sync dosya okuması) yapar — ve sunucudaki *tüm* bağlantılar aynı anda takılır.
+
+Kaçış kapısı `tokio::task::spawn_blocking(closure)`: closure'ı **ayrı bir blocking thread havuzuna** taşır (gerçek OS thread'leri, ihtiyaç halinde açılır) — orayı *kernel'in preemptive* scheduler'ı yönetir; async worker'lar ise `.await` eden task'lar için boş kalır. Kısacası: CPU-bound iş, cooperative dünyadan bunun için inşa edilmiş preemptive dünyaya iade edilir.
+
+```
+yanlış:  2 worker ← 2 CPU-bound task işgal etti  → async dünya kilitli
+doğru:   2 worker ← boş: heartbeat'ler, IO, timer'lar akıyor
+         + blocking havuzu ← CPU işi burada, kernel adilce preempt ediyor
+```
+
+Sıradaki deney, yukarıdaki her iddiayı bir sayıya çevirecek.
 
 [↑ Go back to TOC](#i̇çindekiler)
 
