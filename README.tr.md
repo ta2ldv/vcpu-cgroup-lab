@@ -1465,6 +1465,69 @@ mode=blocking  worst heartbeat delay: 2.5 ms
 3. **`spawn_blocking` tedavidir, ölçülmüştür.** Aynı CPU işi, aynı makine: Δ 4900'den 2.5 ms'e çöker. İş, kernel'in preemptive hakemlik ettiği blocking havuzuna taşındı; async worker'lar boş kaldı. (2.5 ile 1.3 arasındaki küçük fark da dürüst: burn thread'leri makinenin 2 vCPU'su için worker'larla hâlâ yarışıyor — preemption adil paylaştırır, bedava değil.)
 4. **Production çevirisi.** "Bir endpoint bütün API'yi astı"nın anatomisi budur: worker havuzunda tek bir CPU-ağır ya da sync-bloke eden handler, *her* bağlantıyı geciktirir. Ve bir storage engine'in bloke eden çağrılarının (örn. tokio server altında RocksDB okuma/yazmaları) neden `spawn_blocking`'in ya da ayrı bir thread havuzunun arkasına konduğunun ta kendisidir.
 
+### Üçüncü yol: cooperative yielding
+
+Kaba döngünün suçu hiç `.await`'e uğramamaksa, üçüncü bir çare daha var: **ona görgü öğretmek** — teslim noktasını döngünün içine bizzat koymak. Sond: [`tokioburn/src/bin/03_heartbeat_v2.rs`](tokioburn/src/bin/03_heartbeat_v2.rs) — 02 ile aynı, tek farkla: `spawn` modu *kibar* bir burn koşturur:
+
+```rust
+async fn burn_sleepy(secs: u64) -> u64 {          // artık async — nedeni aşağıda
+    let start = Instant::now();
+    let mut count: u64 = 0;
+    while start.elapsed() < Duration::from_secs(secs) {
+        for _ in 0..BATCH {
+            count = std::hint::black_box(count + 1);
+        }
+        sleep(Duration::from_millis(1)).await;    // ← eklenen tek satır: batch başına teslim
+    }
+    count
+}
+```
+
+**Fonksiyon neden `async` olmak zorundaydı:** `.await` yalnız async fn içinde yasaldır — ve bu bir sözdizimi kaprisi değildir. Düz bir `fn`, sonuna kadar kesintisiz koşan makine koduna derlenir; duraklatılacak altyapısı yoktur. `async` işareti, derleyicinin gövdeyi bir **state machine** olarak yeniden inşa etmesini sağlar: her `.await` bir duraklama istasyonu olur, o andaki yerel değişkenler (`count`, `start`…) makinenin içinde saklanır — fonksiyon artık askıya alınıp kaldığı yerden sürdürülebilir. İmza değişikliği = *duraklama ehliyeti*. (Çağrı tarafı da değişir: `burn_sleepy(5)` tek başına bir Future üretir — ancak await edilince koşar: `async { burn_sleepy(5).await }`.)
+
+**Ara perde — hiçbir şeyi ölçmeyen ölçüm (4. yanlış ölçüm).** Bu sondun ilk sürümü güzel sayılar bastı: `spawn` 2.0 ms — tam bir batch süresi, teorinin öngördüğünün ta kendisi. Az kalsın inanıyorduk. Sonra kodun okunması spawn kolunun `tokio::spawn(async { burn_sleepy(5) })` dediğini ortaya çıkardı — **`.await` yok**. Bir `async fn`'i çağırmak *lazy* bir Future üretir — bir plan; await edilmeyen plan asla koşmaz. Burn'ler hiç çalışmamıştı; "spawn" modu ikinci bir kontrol grubuydu ve derleyici tek kelime etmedi. Akılda kalacak parmak izi: **her mod kontrole eşit ölçüyorsa, kimsenin gerçekten koşmadığından şüphelen** (`top`'a bir bakış — ~%0 CPU — kesinleştirir). Async Rust'ın en sessiz bug'ı, canlı yaşandı. Düzeltme altı karakter:
+
+```rust
+tokio::spawn(async { burn_sleepy(5).await });    // .await — plan artık gerçekten koşuyor
+```
+
+Düzeltmeden sonra iki kibar varyant ölçüldü — batch başına `sleep(1 ms)` (03) ve batch başına `yield_now()` (04):
+
+```
+$ ./target/release/03_heartbeat_v2 spawn        # batch başına sleep(1ms)
+mode=spawn     worst heartbeat delay: 2.7 ms
+$ ./target/release/04_heartbeat_v3 spawn        # batch başına yield_now()
+mode=spawn     worst heartbeat delay: 5.4 ms
+```
+
+İki teslim üslubunun farkı:
+
+```
+sleep(1ms).await   = "worker'ı bırakıyorum VE beni 1 ms'den önce UYANDIRMA"
+                      → task 1 ms boyunca 'hazır değil' — kasıtlı zaman kaybı
+
+yield_now().await  = "worker'ı bırakıyorum ama ASLINDA HAZIRIM —
+                      sıradakiler koşsun, queue bana dönünce devam ederim"
+                      → task anında queue'ya hazır olarak girer; queue boşsa
+                        neredeyse sıfır gecikmeyle devam eder
+```
+
+Dört yol yan yana (02 aynı gün yeniden koşuldu: kontrol 2.7, spawn 4900.8, blocking 4.0 — sayılar koşudan koşuya birkaç ms oynar; hikâye oynamaz):
+
+| Yol | CPU işi nerede | En kötü heartbeat Δ | Burn'ün kendi bedeli |
+|---|---|---|---|
+| kaba `tokio::spawn` (02) | worker'larda, teslimsiz | **4900.8 ms** | yok — ama komşulara ölümcül |
+| kibar — batch başına `sleep(1ms)` (03) | worker'larda, her batch'te dinlenir | **2.7 ms** | ~2 ms'lik batch başına ~1 ms yatış (≈%33 öz-vergi) |
+| kibar — batch başına `yield_now()` (04) | worker'larda, teslim eder ama hiç dinlenmez | **5.4 ms** | ~yok |
+| `spawn_blocking` (02) | blocking havuzunda | 4.0 ms | yok (yerine thread maliyeti) |
+
+**Sayılardaki iki ders:**
+
+1. **Kibarlık işe yarıyor ve sınırı batch.** İki kibar varyant da 4900 ms'i tek haneli ms'e indirdi. Kalan gecikme ≈ `.await`'ler arası mesafe (bir-iki ~2 ms'lik batch) — tokio'nun 10–100 µs rehberi, kurbanın gözünden: *senin iki await aran, başkasının en kötü latency'sidir.*
+2. **Sürpriz: `yield_now` (5.4) komşu için `sleep`'ten (2.7) daha kötü — hiçbir şey bedava değil.** Uykulu burn'ler her turda 1 ms dinlenir; heartbeat uyandığı anda worker'lar çoğu kez boştur — anında oturur. `yield_now` burn'leri hiç dinlenmez: worker'lar %100 dolu kalır ve uyanan heartbeat hep mevcut batch'in bitmesini bekler. `sleep`, komşu latency'sini kendi throughput'uyla satın alır (~%33 vergi); `yield_now` throughput'unu korur ve komşulara birkaç ms fatura eder. Servisin neyi koruması gerekiyorsa ona göre seç.
+
+Pratik hiyerarşi geçerli: **parçalanabilir kısa CPU işi → chunk başına yield (ya da mikro-sleep); uzun, yabancı ya da sync iş (RocksDB) → `spawn_blocking`** — bir C kütüphanesinin koduna `.await` serpiştiremezsin.
+
 [↑ Go back to TOC](#i̇çindekiler)
 
 # Bölüm 5 — Kubernetes requests & limits *(yakında)*

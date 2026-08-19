@@ -1465,6 +1465,69 @@ mode=blocking  worst heartbeat delay: 2.5 ms
 3. **`spawn_blocking` is the cure, measured.** Same CPU work, same machine: Δ collapses from 4900 to 2.5 ms. The work moved to the blocking pool, where the kernel arbitrates preemptively; the async workers stayed free. (The small 2.5 vs 1.3 gap is honest too: the burn threads still compete with the workers for the machine's 2 vCPUs — preemption shares fairly, not freely.)
 4. **Production translation.** This is the anatomy of "one endpoint made the whole API hang": a single CPU-heavy or sync-blocking handler on the worker pool delays *every* connection. And it is exactly why a storage engine's blocking calls (e.g. RocksDB reads/writes under a tokio server) belong behind `spawn_blocking` or a dedicated thread pool.
 
+### The third way: cooperative yielding
+
+If the rude loop's crime is never reaching an `.await`, there is a third fix: **teach it manners** — insert a surrender point into the loop itself. The probe is [`tokioburn/src/bin/03_heartbeat_v2.rs`](tokioburn/src/bin/03_heartbeat_v2.rs): same as 02, except `spawn` mode runs a *polite* burn:
+
+```rust
+async fn burn_sleepy(secs: u64) -> u64 {          // async now — see why below
+    let start = Instant::now();
+    let mut count: u64 = 0;
+    while start.elapsed() < Duration::from_secs(secs) {
+        for _ in 0..BATCH {
+            count = std::hint::black_box(count + 1);
+        }
+        sleep(Duration::from_millis(1)).await;    // ← the one added line: surrender per batch
+    }
+    count
+}
+```
+
+**Why the function had to become `async`:** `.await` is only legal inside an async fn — and not as a syntax whim. A plain `fn` compiles to straight-line code that runs to completion; it has no machinery to be paused. Marking it `async` makes the compiler rebuild the body as a **state machine**: every `.await` becomes a pause-station where the live locals (`count`, `start`…) are saved, so the function can be suspended and resumed there. The signature change is the *license to pause*. (The call site changes too: `burn_sleepy(5)` alone produces a Future — it runs only when awaited: `async { burn_sleepy(5).await }`.)
+
+**Interlude — the measurement that measured nothing (wrong measurement #4).** The first version of this probe printed beautiful numbers: `spawn` at 2.0 ms — one batch's length, exactly what theory predicted. We almost believed it. Then a read of the code revealed the spawn arm said `tokio::spawn(async { burn_sleepy(5) })` — **no `.await`**. Calling an `async fn` produces a *lazy* Future — a plan; unawaited, the plan never runs. The burns never executed; "spawn" mode was a second control group, and the compiler never said a word. The fingerprint to remember: **when every mode measures the same as control, suspect that nobody is actually running** (a glance at `top` — ~0 % CPU — settles it). This is async Rust's most silent bug, met live. The fix is six characters:
+
+```rust
+tokio::spawn(async { burn_sleepy(5).await });    // .await — now the plan actually runs
+```
+
+With the fix in, two polite variants were measured — `sleep(1 ms)` per batch (03) and `yield_now()` per batch (04):
+
+```
+$ ./target/release/03_heartbeat_v2 spawn        # sleep(1ms) per batch
+mode=spawn     worst heartbeat delay: 2.7 ms
+$ ./target/release/04_heartbeat_v3 spawn        # yield_now() per batch
+mode=spawn     worst heartbeat delay: 5.4 ms
+```
+
+The difference between the two surrender styles:
+
+```
+sleep(1ms).await   = "I release the worker AND do not wake me before 1 ms"
+                      → task is 'not ready' for 1 ms — a deliberate loss of time
+
+yield_now().await  = "I release the worker but I AM ready —
+                      let the queue turn over, resume me on my turn"
+                      → re-enters the queue ready; resumes almost
+                        immediately if the queue is empty
+```
+
+All four ways, side by side (02 re-run the same day: control 2.7, spawn 4900.8, blocking 4.0 — numbers wobble a couple of ms between runs; the story doesn't):
+
+| Way | Where the CPU work sits | Worst heartbeat Δ | Burn's own cost |
+|---|---|---|---|
+| rude `tokio::spawn` (02) | workers, no surrender | **4900.8 ms** | none — but lethal to neighbors |
+| polite — `sleep(1ms)` per batch (03) | workers, rests every batch | **2.7 ms** | ~1 ms idle per ~2 ms batch (≈33 % self-tax) |
+| polite — `yield_now()` per batch (04) | workers, surrenders but never rests | **5.4 ms** | ~none |
+| `spawn_blocking` (02) | blocking pool | 4.0 ms | none (thread cost instead) |
+
+**Two lessons in the numbers:**
+
+1. **Politeness works, and its bound is the batch.** Both polite variants collapse 4900 ms to single-digit ms. The residual delay ≈ the distance between `.await`s (one or two ~2 ms batches) — tokio's 10–100 µs guidance seen from the victim's side: *your inter-await gap is someone else's worst-case latency.*
+2. **The surprise: `yield_now` (5.4) is worse for the neighbor than `sleep` (2.7) — nothing is free.** Sleepy burns rest 1 ms every cycle, so the workers are often idle at the moment the heartbeat wakes — it seats instantly. `yield_now` burns never rest: the workers stay 100 % occupied and the waking heartbeat always waits out the current batch. `sleep` buys neighbor latency with its own throughput (~33 % tax); `yield_now` keeps its throughput and bills a couple of ms to the neighbors. Pick by what the service must protect.
+
+Practical hierarchy stands: **chunkable short CPU work → yield (or micro-sleep) per chunk; long, foreign, or sync work (RocksDB) → `spawn_blocking`** — you cannot sprinkle `.await`s into a C library's code.
+
 [↑ Go back to TOC](#table-of-contents)
 
 # Part 5 — Kubernetes requests & limits *(coming soon)*

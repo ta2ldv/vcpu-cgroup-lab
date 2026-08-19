@@ -12,3 +12,6 @@ burners/bin/
 .idea/
 .vscode/
 *.swp
+
+# personal note
+personal.txt
