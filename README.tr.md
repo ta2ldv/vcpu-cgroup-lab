@@ -141,6 +141,8 @@ cpuset cpu io memory hugetlb pids rdma misc
 
 Dosya var → makine **cgroup v2** kullanıyor; Bölüm 2 için gereken `cpu` + `cpuset` controller'ları mevcut.
 
+[↑ Go back to TOC](#i̇çindekiler)
+
 ---
 
 # Bölüm 2 — cgroup v2 elle
@@ -509,6 +511,8 @@ Perde A'nın Kubernetes çevirisi bir prod klasiğidir: çok thread'li bir uygul
 | No-internal-process kuralı | Parent controller devrettiyse process'ler yalnız yaprak cgroup'larda yaşar |
 | `cpu.stat` | Kümülatif sicil; `nr_throttled/nr_periods` throttle oranındır |
 | K8s eşlemesi | `requests` → `cpu.weight`, `limits` → `cpu.max`, pod ağacı → cgroup ağacı |
+
+[↑ Go back to TOC](#i̇çindekiler)
 
 ---
 
@@ -1089,6 +1093,8 @@ available_parallelism: 1
 3. **1.5 vCPU sürprizi: Rust *aşağı* yuvarlar.** quota/period = 1.5 → cevap 1 (tabanı 1). Bilinçli muhafazakârlık: 1.5 CPU'luk bütçede iki işçi ikisi birden throttle yer; tek işçi temiz akar, 0.5'lik hak boşta kalır. Utilization değil latency kayırılmış.
 4. **Tuzak yalnız bazı dillerde öldü.** `nproc` tabanlı script'ler, düz C, (automaxprocs'suz) Go `GOMAXPROCS`'u, eski JVM'ler hâlâ node sayısını görür — "`limit: 2` altında 64 worker" kazası karışık dilli filolarda gerçekliğini koruyor. tokio'nun ne yaptığını Bölüm 4 *ölçecek*, varsaymayacak.
 
+[↑ Go back to TOC](#i̇çindekiler)
+
 # Bölüm 4 — Async Rust: tokio ve vCPU *(devam ediyor)*
 
 Async bölümü, gerçek bir teslimatla: Bölüm 3'ün burner'ları *sync* dünyayı ölçtü; burada async karşılıklarını inşa ediyoruz — **tokio tabanlı bir RESP yük üreteci** (Redis protokolü konuşan bir client: sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla). Async'in ekmeğini gerçekten kazandığı yer network IO'dur; araç ile ders burada çakışır. Yol boyunca: tokio'nun runtime modeli (çok sayıda hafif task taşıyan az sayıda OS worker thread'i), limitli bir cgroup içinde kaç worker açtığı — varsayımla değil ölçümle — ve aynı quota'lar altında CPU-bound vs IO-bound task'lar. Cargo burada geri döner (tokio dış bir crate).
@@ -1144,11 +1150,29 @@ Yeni kavramlar, satır satır:
 | `rt.block_on(async { ... })` | Sync dünya (`main`) ile async dünya arasındaki kapı: runtime'a ilk task'ını verir ve o task bitene kadar `main`'i bloklar. |
 | `tokio::time::sleep(...).await` | tokio'nun uykusu. `.await` = "ben beklerken worker'ı bırak — başka task koşabilsin." (`thread::sleep` worker'ı rehin alırdı; o fark Deney 4.3'ün konusu.) Burada tek işi process'i 15 sn hayatta tutmak — dışarıdan incelenebilsin diye. |
 
-Koşular — çıplak, sonra cgroup içinde 0.5 ve 1.5 vCPU (kafes düzeni §3.5'teki gibi). Program uyurken ikinci terminal **dış şahide** bakar:
+Koşular — çıplak, sonra cgroup içinde 0.5 ve 1.5 vCPU:
 
 ```bash
+cargo build --release
+
+# ── 1: çıplak ──
 ./target/release/tokioburn
-ps -T -p <PID>        # process'in tüm thread'leri, isimleriyle
+# program uyurken İKİNCİ terminalden, bastığı PID ile:
+ps -T -p <PID>                  # process'in tüm thread'leri, isimleriyle (dış şahit)
+
+# ── 2: kafeste, quota 0.5 vCPU ──
+sudo mkdir /sys/fs/cgroup/lab
+echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+./target/release/tokioburn
+
+# ── 3: kafeste, quota 1.5 vCPU ──
+echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+./target/release/tokioburn
+
+# ── TEMİZLİK ──
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
+sudo rmdir /sys/fs/cgroup/lab
 ```
 
 Gerçek çıktı (t3.large, çıplak):
@@ -1206,9 +1230,13 @@ tokio workers: 1  (PID: 16841)
 
 3. **Yakalayıcı satır sonuncusu.** "Latency-kritik servise limit koyma" stratejisinin gizli maliyeti: okunacak quota yoksa runtime node'un CPU sayısına düşer ve 64 worker açar. Sakin node'da bu bedava burst kapasitesidir; kalabalık node'da `cpu.weight` o 64 thread'i ~2 CPU'luk paya sıkıştırır — run queue kalabalığı, §3.6'nın A-kaynağı stall'ları. Limitsiz koşarken çare: worker sayısını elle ver (`Builder::worker_threads(n)` ya da `TOKIO_WORKER_THREADS` env var), request'ine yakın boyutlandır.
 
+[↑ Go back to TOC](#i̇çindekiler)
+
 # Bölüm 5 — Kubernetes requests & limits *(yakında)*
 
 Mekanizma, uçtan uca: Bölüm 3'ün burner'ları OpenShift'te pod olarak (statik musl binary, `FROM scratch` imaj), deney matrisi bu kez YAML ile. kubelet'in kurduğu cgroup ağacında gezinti (`kubepods.slice/...`), `requests`/`limits`'in Bölüm 2'deki dosyalara birebir eşlenmesi, elle ölçtüğümüz hücrenin (`echo "50000 100000" > cpu.max` → 241 M iter/s) Kubernetes'in `limits: cpu: 500m`'den kurduğu hücreyle aynı olduğunun teyidi ve her request/limit kombinasyonunun her iş yükü tipi için *faydalı / zararlı / etkisiz* olarak yargılanması.
+
+[↑ Go back to TOC](#i̇çindekiler)
 
 # Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma *(yakında)*
 
@@ -1236,3 +1264,5 @@ VM senaryosu (elle cgroup):            OpenShift senaryosu (requests/limits):
 Sabitler ve değişkenler sıkı ayrılır: network yolu sabit (aynı VM çifti / aynı node çifti, aynı AZ), client hep kısıtsız ve **koşudan koşuya değişen tek şey server'ın CPU kısıtı**. Her koşu aynı üçlüyü kaydeder: client tarafında p99, client tarafında throughput, server tarafında `cpu.stat` / `container_cpu_cfs_throttled_periods_total`. Sonuncusuyla ilkinin korelasyonu, bu lab'ın imza hareketidir.
 
 Teslimat: ölçülmüş boyutlandırma reçeteleri — "şu yük deseni için Redis'e *şu* request/limit, Dragonfly'a *bu*; işte kanıtlayan sayılar."
+
+[↑ Go back to TOC](#i̇çindekiler)

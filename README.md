@@ -141,6 +141,8 @@ cpuset cpu io memory hugetlb pids rdma misc
 
 The file exists → this machine uses **cgroup v2**, and the `cpu` + `cpuset` controllers we need for Part 2 are available.
 
+[↑ Go back to TOC](#table-of-contents)
+
 ---
 
 # Part 2 — cgroup v2 by hand
@@ -509,6 +511,8 @@ The Kubernetes translation of Act A is a production classic: give a multi-thread
 | No-internal-process rule | Once a parent delegates controllers, processes live only in leaf cgroups |
 | `cpu.stat` | Cumulative ledger; `nr_throttled/nr_periods` is your throttle ratio |
 | K8s mapping | `requests` → `cpu.weight`, `limits` → `cpu.max`, pod tree → cgroup tree |
+
+[↑ Go back to TOC](#table-of-contents)
 
 ---
 
@@ -1089,6 +1093,8 @@ available_parallelism: 1
 3. **The 1.5-vCPU surprise: Rust rounds *down*.** quota/period = 1.5 → answer 1 (with a floor of 1). Conservative by design: two workers on 1.5 CPUs of budget would both throttle; one worker runs clean and leaves 0.5 unused. Latency is favored over utilization.
 4. **The trap is dead only in some languages.** `nproc`-based scripts, plain C, Go's `GOMAXPROCS` (without automaxprocs), older JVMs still see the node's count — the "64 workers under `limit: 2`" incident remains real in mixed-language fleets. What tokio does, Part 4 will *measure*, not assume.
 
+[↑ Go back to TOC](#table-of-contents)
+
 # Part 4 — Async Rust: tokio and the vCPU *(in progress)*
 
 The async chapter, with a real deliverable: the Part 3 burners measured the *sync* world; here we build their async counterpart — a **tokio-based RESP load generator** (a client that speaks the Redis protocol: pipelined SET/GET at a fixed rate, reporting p50/p99 latency). Network IO is where async actually earns its keep, so the tool and the lesson coincide. Along the way: tokio's runtime model (a few OS worker threads carrying many lightweight tasks), how many workers it starts inside a limited cgroup — measured, not assumed — and CPU-bound vs IO-bound tasks under the same quotas. Cargo returns here (tokio is an external crate).
@@ -1144,11 +1150,29 @@ New concepts, line by line:
 | `rt.block_on(async { ... })` | The gate between the sync world (`main`) and the async world: hands the runtime its first task and blocks `main` until that task completes. |
 | `tokio::time::sleep(...).await` | tokio's sleep. `.await` means "while I wait, release the worker — other tasks may run." (`thread::sleep` would hold the worker hostage; that difference is Experiment 4.3.) Here it just keeps the process alive 15 s so it can be inspected from outside. |
 
-Runs — bare, then inside a cgroup at 0.5 and 1.5 vCPU (cage setup as in §3.5). While the program sleeps, a second terminal checks the **external witness**:
+The runs — bare, then inside a cgroup at 0.5 and 1.5 vCPU:
 
 ```bash
+cargo build --release
+
+# ── 1: bare ──
 ./target/release/tokioburn
-ps -T -p <PID>        # every thread of the process, with names
+# while it sleeps, from a SECOND terminal, with the PID it printed:
+ps -T -p <PID>                  # every thread of the process, with names (external witness)
+
+# ── 2: caged, quota 0.5 vCPU ──
+sudo mkdir /sys/fs/cgroup/lab
+echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+./target/release/tokioburn
+
+# ── 3: caged, quota 1.5 vCPU ──
+echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+./target/release/tokioburn
+
+# ── CLEANUP ──
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
+sudo rmdir /sys/fs/cgroup/lab
 ```
 
 Real output (t3.large, bare):
@@ -1206,9 +1230,13 @@ tokio workers: 1  (PID: 16841)
 
 3. **The last row is the catch.** The "no limits for latency-critical services" strategy has a hidden cost: with no quota to read, the runtime falls back to the node's CPU count and starts 64 workers. On a quiet node that's free burst capacity; on a busy node, `cpu.weight` squeezes those 64 threads into a ~2-CPU share — run-queue crowding, §3.6's source-A stalls. The cure when running limitless: set the worker count explicitly (`Builder::worker_threads(n)` or the `TOKIO_WORKER_THREADS` env var), sized near your request.
 
+[↑ Go back to TOC](#table-of-contents)
+
 # Part 5 — Kubernetes requests & limits *(coming soon)*
 
 The mechanism, end to end: the Part 3 burners deployed as pods on OpenShift (a static musl binary in a `FROM scratch` image), with the experiment matrix replayed in YAML. Walking the cgroup tree that kubelet builds (`kubepods.slice/...`), mapping `requests`/`limits` to the exact files from Part 2, confirming that the cell we measured by hand (`echo "50000 100000" > cpu.max` → 241 M iter/s) is the same cell Kubernetes builds from `limits: cpu: 500m`, and judging each request/limit combination as *helpful, harmful, or neutral* for each workload type.
+
+[↑ Go back to TOC](#table-of-contents)
 
 # Part 6 — Performance lab: sizing Redis & Dragonfly *(coming soon)*
 
@@ -1236,3 +1264,5 @@ VM scenario (cgroup by hand):          OpenShift scenario (requests/limits):
 Constants and variables, strictly separated: the network path stays fixed (same VM pair / same node pair, same AZ), the client stays unconstrained, and **the only thing that changes between runs is the server's CPU constraint**. Every run records the same triple: client-side p99, client-side throughput, server-side `cpu.stat` / `container_cpu_cfs_throttled_periods_total`. The correlation between the last one and the first one is the lab's signature move.
 
 Deliverable: measured sizing recipes — "for this workload shape, give Redis *this* request/limit and Dragonfly *that* one, and here are the numbers that prove it."
+
+[↑ Go back to TOC](#table-of-contents)
