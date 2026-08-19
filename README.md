@@ -41,6 +41,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [4.1 Cargo returns — project setup](#41-cargo-returns--project-setup)
   - [4.2 How tokio schedules — cooperative, `.await`, task queues](#42-how-tokio-schedules--cooperative-await-task-queues)
   - [Experiment 4.3 — how many workers does tokio start?](#experiment-43--how-many-workers-does-tokio-start)
+  - [Experiment 4.4 — blocking the event loop, measured](#experiment-44--blocking-the-event-loop-measured)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 - [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -1116,9 +1117,37 @@ tokio = { version = "1", features = ["full"] }
 
 (`features = ["full"]` enables all tokio components — runtime, net, time. Production builds pick selectively; for a lab, full is practical.) First `cargo build --release` takes a minute or two while tokio compiles; subsequent builds are seconds. The project lives at [`tokioburn/`](tokioburn/) in this repo.
 
+**Layout: one project, one binary per experiment.** Instead of overwriting `src/main.rs` for every experiment, the project uses cargo's multi-binary layout: each file under `src/bin/` compiles to its own binary, all sharing one `Cargo.toml` and one dependency build (tokio compiles once). `cargo build --release` builds them all; each runs as `./target/release/<file-name>`.
+
+```
+tokioburn/src/bin/
+├── 01_workers.rs      ← experiment 4.3
+├── 02_heartbeat.rs    ← experiment 4.4
+└── ...                ← one probe per experiment, numbered like burners/
+```
+
 ## 4.2 How tokio schedules — cooperative, `.await`, task queues
 
 Theory first — five building blocks that everything in async Rust hangs on.
+
+### Vocabulary: thread, worker, task
+
+Three words carry this whole part; fix them before anything else.
+
+| Term | What it is | Who creates & manages it | Cost | How it's interrupted |
+|---|---|---|---|---|
+| **Thread** | An OS execution unit; the kernel schedules it onto logical CPUs | the kernel | ~MB of stack, syscalls to create | **preemptively** — the kernel forces it off the CPU |
+| **Worker** | Not a new concept: an ordinary **thread that tokio creates** and dedicates to one job — loop forever, pull tasks from the task queues, run them. Visible in `ps -T` as `tokio-rt-worker` (Experiment 4.3) | tokio (at runtime startup; count from `available_parallelism()`) | same as any thread | same as any thread |
+| **Task** | A unit of async work (`async { ... }` handed to `tokio::spawn`) — a *record of work to do*, not an execution unit; it runs **inside** whichever worker picks it up | tokio | ~hundreds of bytes — millions are fine | **cooperatively only** — nobody can force it off; it must reach an `.await` |
+
+The two layers, stacked:
+
+```
+tasks           → managed by tokio  → run INSIDE worker threads
+worker threads  → managed by kernel → run ON logical CPUs
+```
+
+One sentence to keep: **a task is a work record, a worker is the thread that executes such records, and the kernel only ever sees the workers.**
 
 ### Preemptive vs cooperative
 
@@ -1192,7 +1221,7 @@ The experiments that follow turn every claim above into numbers.
 
 tokio's multi-thread runtime carries many lightweight tasks on a few OS **worker threads**. The sizing of that pool is exactly where Experiment 3.7 becomes practical: does tokio follow `available_parallelism()` — and therefore see cgroup quotas — or does it read the machine? Measured, not assumed.
 
-The probe ([`tokioburn/src/main.rs`](tokioburn/src/main.rs)):
+The probe ([`tokioburn/src/bin/01_workers.rs`](tokioburn/src/bin/01_workers.rs)):
 
 ```rust
 use std::thread;
@@ -1229,7 +1258,7 @@ The runs — bare, then inside a cgroup at 0.5 and 1.5 vCPU:
 cargo build --release
 
 # ── 1: bare ──
-./target/release/tokioburn
+./target/release/01_workers
 # while it sleeps, from a SECOND terminal, with the PID it printed:
 ps -T -p <PID>                  # every thread of the process, with names (external witness)
 
@@ -1237,11 +1266,11 @@ ps -T -p <PID>                  # every thread of the process, with names (exter
 sudo mkdir /sys/fs/cgroup/lab
 echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
 echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
-./target/release/tokioburn
+./target/release/01_workers
 
 # ── 3: caged, quota 1.5 vCPU ──
 echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
-./target/release/tokioburn
+./target/release/01_workers
 
 # ── CLEANUP ──
 echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
@@ -1251,13 +1280,13 @@ sudo rmdir /sys/fs/cgroup/lab
 Real output (t3.large, bare):
 
 ```
-$ ./target/release/tokioburn
+$ ./target/release/01_workers
 available_parallelism: Ok(2)
 tokio workers: 2  (PID: 16590)
 
 $ ps -T -p 16590
     PID    SPID TTY          TIME CMD
-  16590   16590 pts/1    00:00:00 tokioburn          ← main thread (parked in block_on)
+  16590   16590 pts/1    00:00:00 01_workers          ← main thread (parked in block_on)
   16590   16591 pts/1    00:00:00 tokio-rt-worker    ← worker 1
   16590   16592 pts/1    00:00:00 tokio-rt-worker    ← worker 2
 ```
@@ -1268,15 +1297,15 @@ The cgroup runs (same probe, caged shell):
 
 ```
 $ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max     # 0.5 vCPU
-$ ./target/release/tokioburn
+$ ./target/release/01_workers
 available_parallelism: Ok(1)
 tokio workers: 1  (PID: 16611)
 $ ps -T -p 16611
-  16611   16611  tokioburn
+  16611   16611  01_workers
   16611   16612  tokio-rt-worker          ← a single worker now
 
 $ echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # 1.5 vCPU
-$ ./target/release/tokioburn
+$ ./target/release/01_workers
 available_parallelism: Ok(1)
 tokio workers: 1  (PID: 16841)
 ```
@@ -1302,6 +1331,92 @@ tokio workers: 1  (PID: 16841)
 | **no limit, only `request: 2`** | **64** |
 
 3. **The last row is the catch.** The "no limits for latency-critical services" strategy has a hidden cost: with no quota to read, the runtime falls back to the node's CPU count and starts 64 workers. On a quiet node that's free burst capacity; on a busy node, `cpu.weight` squeezes those 64 threads into a ~2-CPU share — run-queue crowding, §3.6's source-A stalls. The cure when running limitless: set the worker count explicitly (`Builder::worker_threads(n)` or the `TOKIO_WORKER_THREADS` env var), sized near your request.
+
+## Experiment 4.4 — blocking the event loop, measured
+
+Every claim of §4.2, turned into numbers. One probe, three modes: a **heartbeat task** that wants to wake every 100 ms and records its worst delay (Δ), sharing the runtime with two `.await`-less CPU-bound **burn tasks** — placed the wrong way (`tokio::spawn`), the right way (`spawn_blocking`), or not at all (control).
+
+The probe is [`tokioburn/src/bin/02_heartbeat.rs`](tokioburn/src/bin/02_heartbeat.rs):
+
+```rust
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+const BATCH: u64 = 1_000_000;
+
+fn burn(secs: u64) -> u64 {                    // 02_threads' counter — deliberately .await-less
+    let start = Instant::now();
+    let mut count: u64 = 0;
+    while start.elapsed() < Duration::from_secs(secs) {
+        for _ in 0..BATCH {
+            count = std::hint::black_box(count + 1);
+        }
+    }
+    count
+}
+
+#[tokio::main]                                  // macro form of 4.3's Builder: default runtime + block_on
+async fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+
+    let hb = tokio::spawn(async {               // the latency sensor of §4.2
+        let mut worst = Duration::ZERO;
+        for _ in 0..50 {                        // 50 × 100 ms ≈ 5 s
+            let planned = Instant::now() + Duration::from_millis(100);
+            sleep(Duration::from_millis(100)).await;
+            let delta = planned.elapsed();      // Δ: how late past the planned wake-up?
+            if delta > worst { worst = delta; }
+        }
+        worst
+    });
+
+    match mode.as_str() {
+        "spawn"    => { for _ in 0..2 { tokio::spawn(async { burn(5) }); } }          // wrong way
+        "blocking" => { for _ in 0..2 { tokio::task::spawn_blocking(|| burn(5)); } }  // right way
+        _          => {}                                                             // control
+    }
+
+    let worst = hb.await.unwrap();              // a task's JoinHandle is .awaited, not joined
+    println!("mode={:8}  worst heartbeat delay: {:.1} ms",
+             if mode.is_empty() { "control" } else { &mode },
+             worst.as_secs_f64() * 1000.0);
+}
+```
+
+The runs (bare EC2 — no cgroup; this time the culprit is the code, not a quota):
+
+```bash
+cargo build --release
+./target/release/02_heartbeat            # A: control
+./target/release/02_heartbeat spawn      # B: wrong way
+./target/release/02_heartbeat blocking   # C: right way
+```
+
+Real output (t3.large):
+
+```
+$ ./target/release/02_heartbeat
+mode=control   worst heartbeat delay: 1.3 ms
+$ ./target/release/02_heartbeat spawn
+mode=spawn     worst heartbeat delay: 4900.1 ms
+$ ./target/release/02_heartbeat blocking
+mode=blocking  worst heartbeat delay: 2.5 ms
+```
+
+### Results
+
+| Mode | Where the CPU work ran | Worst heartbeat Δ |
+|---|---|---|
+| control | nowhere (no burn) | 1.3 ms |
+| `tokio::spawn` | on the 2 async workers | **4900.1 ms** |
+| `spawn_blocking` | on the blocking pool | 2.5 ms |
+
+### What it teaches
+
+1. **4900 ms is not a slowdown — it is starvation.** The heartbeat asked to wake every 100 ms; with both workers held hostage it did not get its *first* turn until the burns finished (~4.9 s). Cooperative scheduling has no fairness rescue: a task that never `.await`s starves every task in the queues, completely, for its whole duration.
+2. **Note what the kernel did and didn't do.** The kernel kept preempting the worker *threads* the whole time — other processes on the machine ran fine. But tokio's task queues are not the kernel's run queue: preemption one layer down does nothing for tasks stuck a layer up. Two schedulers are stacked; only the bottom one is preemptive.
+3. **`spawn_blocking` is the cure, measured.** Same CPU work, same machine: Δ collapses from 4900 to 2.5 ms. The work moved to the blocking pool, where the kernel arbitrates preemptively; the async workers stayed free. (The small 2.5 vs 1.3 gap is honest too: the burn threads still compete with the workers for the machine's 2 vCPUs — preemption shares fairly, not freely.)
+4. **Production translation.** This is the anatomy of "one endpoint made the whole API hang": a single CPU-heavy or sync-blocking handler on the worker pool delays *every* connection. And it is exactly why a storage engine's blocking calls (e.g. RocksDB reads/writes under a tokio server) belong behind `spawn_blocking` or a dedicated thread pool.
 
 [↑ Go back to TOC](#table-of-contents)
 

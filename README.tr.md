@@ -41,6 +41,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [4.1 Cargo'nun dönüşü — proje kurulumu](#41-cargonun-dönüşü--proje-kurulumu)
   - [4.2 tokio nasıl zamanlar — cooperative, `.await`, task queue'lar](#42-tokio-nasıl-zamanlar--cooperative-await-task-queuelar)
   - [Deney 4.3 — tokio kaç worker açar?](#deney-43--tokio-kaç-worker-açar)
+  - [Deney 4.4 — event loop'u bloke etmek, ölçülmüş](#deney-44--event-loopu-bloke-etmek-ölçülmüş)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 - [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -1116,9 +1117,37 @@ tokio = { version = "1", features = ["full"] }
 
 (`features = ["full"]` tokio'nun tüm bileşenlerini açar — runtime, net, time. Production build'leri seçici davranır; lab için full pratik.) İlk `cargo build --release` tokio derlenirken 1-2 dakika sürer; sonrakiler saniyeler. Proje bu repo'da: [`tokioburn/`](tokioburn/).
 
+**Düzen: tek proje, deney başına bir binary.** Her deneyde `src/main.rs`'in üstüne yazmak yerine proje cargo'nun çoklu-binary düzenini kullanır: `src/bin/` altındaki her dosya kendi binary'sine derlenir; hepsi tek `Cargo.toml`'u ve tek dependency build'ini paylaşır (tokio bir kez derlenir). `cargo build --release` hepsini derler; her biri `./target/release/<dosya-adı>` olarak koşar.
+
+```
+tokioburn/src/bin/
+├── 01_workers.rs      ← deney 4.3
+├── 02_heartbeat.rs    ← deney 4.4
+└── ...                ← deney başına bir sond, burners/ gibi numaralı
+```
+
 ## 4.2 tokio nasıl zamanlar — cooperative, `.await`, task queue'lar
 
 Önce teori — async Rust'ta her şeyin asılı durduğu beş yapı taşı.
+
+### Vocabulary: thread, worker, task
+
+Bu bölümün tamamını üç kelime taşıyor; her şeyden önce onları sabitle.
+
+| Terim | Nedir | Kim yaratır & yönetir | Maliyet | Nasıl kesilir |
+|---|---|---|---|---|
+| **Thread** | OS'in yürütme birimi; kernel onu logical CPU'lara zamanlar | kernel | ~MB stack, yaratması syscall | **preemptive** — kernel CPU'dan zorla indirir |
+| **Worker** | Yeni bir kavram değil: **tokio'nun yarattığı sıradan bir thread**, tek göreve adanmış — sonsuz döngüde task queue'lardan task çek, çalıştır. `ps -T`'de `tokio-rt-worker` olarak görünür (Deney 4.3) | tokio (runtime açılışında; sayı `available_parallelism()`'den) | herhangi bir thread'le aynı | herhangi bir thread'le aynı |
+| **Task** | Async iş birimi (`tokio::spawn`'a verilen `async { ... }`) — bir *yapılacak iş kaydı*, yürütme birimi değil; onu alan worker'ın **içinde** koşar | tokio | ~yüzlerce byte — milyonlarcası sorun değil | **yalnız cooperative** — kimse zorla indiremez; bir `.await`'e gelmesi gerekir |
+
+İki katman, üst üste:
+
+```
+task'lar         → tokio yönetir  → worker thread'lerin İÇİNDE koşar
+worker thread'ler → kernel yönetir → logical CPU'ların ÜSTÜNDE koşar
+```
+
+Cebe girecek cümle: **task bir iş kaydıdır, worker o kayıtları işleyen thread'dir ve kernel yalnızca worker'ları görür.**
 
 ### Preemptive vs cooperative
 
@@ -1192,7 +1221,7 @@ Bundan sonraki deneyler, yukarıdaki her iddiayı sayılara çevirecek.
 
 tokio'nun multi-thread runtime'ı, çok sayıda hafif task'ı az sayıda OS **worker thread**'i üstünde taşır. O havuzun boyutlandırması, Deney 3.7'nin pratiğe döküldüğü yer: tokio `available_parallelism()`'i mi izliyor — yani cgroup quota'larını görüyor mu — yoksa makineyi mi okuyor? Varsayımla değil, ölçümle.
 
-Sonda ([`tokioburn/src/main.rs`](tokioburn/src/main.rs)):
+Sonda ([`tokioburn/src/bin/01_workers.rs`](tokioburn/src/bin/01_workers.rs)):
 
 ```rust
 use std::thread;
@@ -1229,7 +1258,7 @@ Koşular — çıplak, sonra cgroup içinde 0.5 ve 1.5 vCPU:
 cargo build --release
 
 # ── 1: çıplak ──
-./target/release/tokioburn
+./target/release/01_workers
 # program uyurken İKİNCİ terminalden, bastığı PID ile:
 ps -T -p <PID>                  # process'in tüm thread'leri, isimleriyle (dış şahit)
 
@@ -1237,11 +1266,11 @@ ps -T -p <PID>                  # process'in tüm thread'leri, isimleriyle (dı�
 sudo mkdir /sys/fs/cgroup/lab
 echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
 echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
-./target/release/tokioburn
+./target/release/01_workers
 
 # ── 3: kafeste, quota 1.5 vCPU ──
 echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
-./target/release/tokioburn
+./target/release/01_workers
 
 # ── TEMİZLİK ──
 echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
@@ -1251,13 +1280,13 @@ sudo rmdir /sys/fs/cgroup/lab
 Gerçek çıktı (t3.large, çıplak):
 
 ```
-$ ./target/release/tokioburn
+$ ./target/release/01_workers
 available_parallelism: Ok(2)
 tokio workers: 2  (PID: 16590)
 
 $ ps -T -p 16590
     PID    SPID TTY          TIME CMD
-  16590   16590 pts/1    00:00:00 tokioburn          ← main thread (block_on'da park halinde)
+  16590   16590 pts/1    00:00:00 01_workers          ← main thread (block_on'da park halinde)
   16590   16591 pts/1    00:00:00 tokio-rt-worker    ← worker 1
   16590   16592 pts/1    00:00:00 tokio-rt-worker    ← worker 2
 ```
@@ -1268,15 +1297,15 @@ Cgroup koşuları (aynı sond, kafesteki shell):
 
 ```
 $ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max     # 0.5 vCPU
-$ ./target/release/tokioburn
+$ ./target/release/01_workers
 available_parallelism: Ok(1)
 tokio workers: 1  (PID: 16611)
 $ ps -T -p 16611
-  16611   16611  tokioburn
+  16611   16611  01_workers
   16611   16612  tokio-rt-worker          ← artık tek worker
 
 $ echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # 1.5 vCPU
-$ ./target/release/tokioburn
+$ ./target/release/01_workers
 available_parallelism: Ok(1)
 tokio workers: 1  (PID: 16841)
 ```
@@ -1302,6 +1331,92 @@ tokio workers: 1  (PID: 16841)
 | **limit yok, sadece `request: 2`** | **64** |
 
 3. **Yakalayıcı satır sonuncusu.** "Latency-kritik servise limit koyma" stratejisinin gizli maliyeti: okunacak quota yoksa runtime node'un CPU sayısına düşer ve 64 worker açar. Sakin node'da bu bedava burst kapasitesidir; kalabalık node'da `cpu.weight` o 64 thread'i ~2 CPU'luk paya sıkıştırır — run queue kalabalığı, §3.6'nın A-kaynağı stall'ları. Limitsiz koşarken çare: worker sayısını elle ver (`Builder::worker_threads(n)` ya da `TOKIO_WORKER_THREADS` env var), request'ine yakın boyutlandır.
+
+## Deney 4.4 — event loop'u bloke etmek, ölçülmüş
+
+§4.2'nin her iddiası, sayıya dökülmüş hali. Tek sond, üç mod: her 100 ms'de bir uyanmak isteyen ve en kötü gecikmesini (Δ) kaydeden bir **heartbeat task**, runtime'ı iki `.await`'siz CPU-bound **burn task** ile paylaşıyor — yanlış yoldan (`tokio::spawn`), doğru yoldan (`spawn_blocking`) ya da hiç (kontrol).
+
+Sond: [`tokioburn/src/bin/02_heartbeat.rs`](tokioburn/src/bin/02_heartbeat.rs):
+
+```rust
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+const BATCH: u64 = 1_000_000;
+
+fn burn(secs: u64) -> u64 {                    // 02_threads'in sayacı — kasıtlı olarak .await'siz
+    let start = Instant::now();
+    let mut count: u64 = 0;
+    while start.elapsed() < Duration::from_secs(secs) {
+        for _ in 0..BATCH {
+            count = std::hint::black_box(count + 1);
+        }
+    }
+    count
+}
+
+#[tokio::main]                                  // 4.3'teki Builder'ın makro hali: default runtime + block_on
+async fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+
+    let hb = tokio::spawn(async {               // §4.2'nin latency sensörü
+        let mut worst = Duration::ZERO;
+        for _ in 0..50 {                        // 50 × 100 ms ≈ 5 s
+            let planned = Instant::now() + Duration::from_millis(100);
+            sleep(Duration::from_millis(100)).await;
+            let delta = planned.elapsed();      // Δ: planlanan uyanmadan ne kadar geç?
+            if delta > worst { worst = delta; }
+        }
+        worst
+    });
+
+    match mode.as_str() {
+        "spawn"    => { for _ in 0..2 { tokio::spawn(async { burn(5) }); } }          // yanlış yol
+        "blocking" => { for _ in 0..2 { tokio::task::spawn_blocking(|| burn(5)); } }  // doğru yol
+        _          => {}                                                             // kontrol
+    }
+
+    let worst = hb.await.unwrap();              // task'ın JoinHandle'ı join edilmez, .await edilir
+    println!("mode={:8}  worst heartbeat delay: {:.1} ms",
+             if mode.is_empty() { "control" } else { &mode },
+             worst.as_secs_f64() * 1000.0);
+}
+```
+
+Koşular (çıplak EC2 — cgroup yok; bu kez suçlu quota değil, kodun kendisi):
+
+```bash
+cargo build --release
+./target/release/02_heartbeat            # A: kontrol
+./target/release/02_heartbeat spawn      # B: yanlış yol
+./target/release/02_heartbeat blocking   # C: doğru yol
+```
+
+Gerçek çıktı (t3.large):
+
+```
+$ ./target/release/02_heartbeat
+mode=control   worst heartbeat delay: 1.3 ms
+$ ./target/release/02_heartbeat spawn
+mode=spawn     worst heartbeat delay: 4900.1 ms
+$ ./target/release/02_heartbeat blocking
+mode=blocking  worst heartbeat delay: 2.5 ms
+```
+
+### Sonuçlar
+
+| Mod | CPU işi nerede koştu | En kötü heartbeat Δ |
+|---|---|---|
+| kontrol | hiçbir yerde (burn yok) | 1.3 ms |
+| `tokio::spawn` | 2 async worker'da | **4900.1 ms** |
+| `spawn_blocking` | blocking havuzunda | 2.5 ms |
+
+### Öğrettikleri
+
+1. **4900 ms bir yavaşlama değil — açlıktır.** Heartbeat her 100 ms'de uyanmak istedi; iki worker da rehinken *ilk* sırasını burn'ler bitene kadar (~4.9 s) alamadı. Cooperative zamanlamada adalet kurtarması yoktur: hiç `.await` etmeyen task, queue'lardaki her task'ı, süresi boyunca, tamamen aç bırakır.
+2. **Kernel'in ne yaptığına ve yapmadığına dikkat.** Kernel bu süre boyunca worker *thread'lerini* preempt etmeye devam etti — makinedeki diğer process'ler gayet iyi koştu. Ama tokio'nun task queue'ları kernel'in run queue'su değildir: bir kat aşağıdaki preemption, bir kat yukarıda sıkışan task'lara hiçbir şey yapamaz. İki scheduler üst üstedir; yalnız alttaki preemptive'dir.
+3. **`spawn_blocking` tedavidir, ölçülmüştür.** Aynı CPU işi, aynı makine: Δ 4900'den 2.5 ms'e çöker. İş, kernel'in preemptive hakemlik ettiği blocking havuzuna taşındı; async worker'lar boş kaldı. (2.5 ile 1.3 arasındaki küçük fark da dürüst: burn thread'leri makinenin 2 vCPU'su için worker'larla hâlâ yarışıyor — preemption adil paylaştırır, bedava değil.)
+4. **Production çevirisi.** "Bir endpoint bütün API'yi astı"nın anatomisi budur: worker havuzunda tek bir CPU-ağır ya da sync-bloke eden handler, *her* bağlantıyı geciktirir. Ve bir storage engine'in bloke eden çağrılarının (örn. tokio server altında RocksDB okuma/yazmaları) neden `spawn_blocking`'in ya da ayrı bir thread havuzunun arkasına konduğunun ta kendisidir.
 
 [↑ Go back to TOC](#i̇çindekiler)
 
