@@ -49,10 +49,10 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 |---|------|--------------------|--------|
 | 1 | [CPU fundamentals](#part-1--cpu-fundamentals) | What is a core, a hyperthread, a vCPU — and who schedules whom? | ✅ |
 | 2 | [cgroup v2 by hand](#part-2--cgroup-v2-by-hand) | How does the kernel slice CPU time, and how do I watch it happen? | ✅ |
-| 3 | Rust load generator | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | ✅ |
-| 4 | Async Rust (tokio) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | 🔜 |
-| 5 | Kubernetes requests/limits | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
-| 6 | Performance lab (Redis & Dragonfly) | What are the *right* CPU constraints for two opposite engine architectures — proven by measurement, on VM and OpenShift? | 🔜 |
+| 3 | [Rust load generator](#part-3--rust-load-generator) | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | ✅ |
+| 4 | [Async Rust (tokio)](#part-4--async-rust-tokio-and-the-vcpu-in-progress) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | ⏳ |
+| 5 | [Kubernetes requests/limits](#part-5--kubernetes-requests--limits-coming-soon) | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
+| 6 | [Performance lab (Redis & Dragonfly)](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon) | What are the *right* CPU constraints for two opposite engine architectures — proven by measurement, on VM and OpenShift? | 🔜 |
 
 ---
 

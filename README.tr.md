@@ -49,10 +49,10 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 |---|------|------------------|-------|
 | 1 | [Temel kavramlar](#bölüm-1--temel-kavramlar) | Core, hyperthread, vCPU nedir — kim kimi zamanlar? | ✅ |
 | 2 | [cgroup v2 elle](#bölüm-2--cgroup-v2-elle) | Kernel CPU zamanını nasıl dilimler, bunu nasıl canlı izlerim? | ✅ |
-| 3 | Rust ile yük üreteci | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | ✅ |
-| 4 | Async Rust (tokio) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | 🔜 |
-| 5 | Kubernetes requests/limits | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
-| 6 | Performans lab'ı (Redis & Dragonfly) | Zıt mimarili iki engine için *doğru* CPU kısıtları ne — VM'de ve OpenShift'te, ölçümle kanıtlı? | 🔜 |
+| 3 | [Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci) | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | ✅ |
+| 4 | [Async Rust (tokio)](#bölüm-4--async-rust-tokio-ve-vcpu-devam-ediyor) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | ⏳ |
+| 5 | [Kubernetes requests/limits](#bölüm-5--kubernetes-requests--limits-yakında) | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
+| 6 | [Performans lab'ı (Redis & Dragonfly)](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında) | Zıt mimarili iki engine için *doğru* CPU kısıtları ne — VM'de ve OpenShift'te, ölçümle kanıtlı? | 🔜 |
 
 ---
 
