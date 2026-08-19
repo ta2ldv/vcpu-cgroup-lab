@@ -43,6 +43,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 4.3 — how many workers does tokio start?](#experiment-43--how-many-workers-does-tokio-start)
   - [Experiment 4.4 — blocking the event loop, measured](#experiment-44--blocking-the-event-loop-measured)
   - [Experiment 4.5 — a million waiting tasks on two threads](#experiment-45--a-million-waiting-tasks-on-two-threads)
+  - [Experiment 4.6 — async under quota](#experiment-46--async-under-quota)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 - [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -1631,6 +1632,90 @@ $ ps -T -p <PID>          # identical at every scale:
 | scale the CPU limit with event rate | honest but costs money; the formula says how much |
 | shard connections across pods | horizontal version of the same formula |
 | ~~add RAM~~ | not the bottleneck for waiting tasks — measure before buying |
+
+## Experiment 4.6 — async under quota
+
+The closing experiment of the chapter joins its two worlds: Part 2's cgroup quota meets Part 4's async runtime. **No new code** — the existing probes run twice: first bare, then inside a 0.5-vCPU cage. The question: can tokio-level politeness (`.await`s, yields) protect tasks from a cgroup freeze?
+
+```bash
+# ── phase 1: no quota (baseline, same day) ──
+./target/release/02_heartbeat                  # heartbeat alone
+./target/release/03_heartbeat_v2 spawn         # polite burns (sleep 1ms/batch)
+./target/release/04_heartbeat_v3 spawn         # polite burns (yield_now/batch)
+./target/release/05_ioload 10000               # 10k waiting tasks
+./target/release/05_ioload 100000              # 100k waiting tasks
+
+# ── phase 2: cage the shell, 0.5 vCPU, run the same five ──
+sudo mkdir /sys/fs/cgroup/lab
+echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+cat /proc/$$/cgroup                            # 0::/lab
+# ...same five runs...
+
+# ── cleanup ──
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
+sudo rmdir /sys/fs/cgroup/lab
+```
+
+Full run (t3.large):
+
+```
+$ ./target/release/02_heartbeat                # ── no quota
+mode=control   worst heartbeat delay: 1.4 ms
+$ ./target/release/03_heartbeat_v2 spawn
+mode=spawn     worst heartbeat delay: 2.9 ms
+$ ./target/release/04_heartbeat_v3 spawn
+mode=spawn     worst heartbeat delay: 3.8 ms
+$ ./target/release/05_ioload 10000
+10000 task(s): finished in 5.10 s, worst wake-up delay: 5.0 ms
+$ ./target/release/05_ioload 100000
+100000 task(s): finished in 5.41 s, worst wake-up delay: 45.9 ms
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # ── 0.5 vCPU
+$ ./target/release/02_heartbeat
+mode=control   worst heartbeat delay: 3.4 ms
+$ ./target/release/03_heartbeat_v2 spawn
+mode=spawn     worst heartbeat delay: 49.0 ms
+$ ./target/release/04_heartbeat_v3 spawn
+mode=spawn     worst heartbeat delay: 55.1 ms
+$ ./target/release/05_ioload 10000
+10000 task(s): finished in 5.11 s, worst wake-up delay: 4.6 ms
+$ ./target/release/05_ioload 100000
+100000 task(s): finished in 8.78 s, worst wake-up delay: 178.0 ms
+```
+
+### Results
+
+| Run | No quota | 0.5 vCPU | Change |
+|---|---|---|---|
+| heartbeat alone | 1.4 ms | 3.4 ms | ~none |
+| polite burns, `sleep` (03) | 2.9 ms | **49.0 ms** | 17× |
+| polite burns, `yield_now` (04) | 3.8 ms | **55.1 ms** | 14× |
+| 10 000 waiting tasks | 5.0 ms | 4.6 ms | **none** |
+| 100 000 waiting tasks | 45.9 ms · 5.41 s | **178.0 ms · 8.78 s** | 4× delay, run stretched 62 % |
+
+### What it teaches
+
+1. **49–55 ms carries a signature.** It is §3.6's source-B formula returned: freeze ≈ the part of the period left after the quota — ~50 ms. The polite burns spend the budget in the first half of each window, and the kernel freezes **the worker threads themselves**. The critical point: **an `.await` surrender is worthless inside a frozen thread** — there is no running worker left to accept the handoff. This is Experiment 4.4's mirror image: there the kernel was healthy and the tokio layer jammed; here the tokio layer is polite and the kernel layer (cgroup) freezes everyone. **In a two-layer scheduler stack, the cure must live in the layer that is failing — tokio's politeness is invisible to the cgroup.**
+2. **A quota does not punish waiting.** The heartbeat-alone and 10 k-task runs didn't feel the limit at all: waiting tasks consume no CPU, and the quota meters only CPU *consumed*. Waiting stays free even in a cage.
+3. **At 100 k the wake-up bill hit the limit.** ~1 M wake-ups/s of bookkeeping wants ~1 vCPU; the cage grants 0.5 → throttled in every window: the run stretched 5.4 → 8.8 s (the arithmetic of receiving half of what you ask), and freeze chains produced 178 ms peaks. Experiment 4.5's sizing formula gains its final term: **events/s × cost-per-event must fit inside the *limit*.**
+4. **The summary sentence of the whole chapter:** async does not protect you from a quota; it only ensures the freeze bills *everyone in the process at once* — even 100 000 tasks' worth of concurrency is hostage to a single `cpu.max` line.
+
+### Problem → approach → options (4.6)
+
+**The real-world problem this maps to:** a pod with a CPU limit shows periodic latency spikes of tens of ms hitting *all* requests simultaneously, in a rhythm (~every period); average CPU sits at a plateau equal to the limit. Classic k8s postmortem: "p99 spikes every 100 ms, CPU graph flat at 50 %."
+
+**How to approach it:** correlate the spikes with `container_cpu_cfs_throttled_periods_total` (the pod-world `nr_throttled`). If they march together, the freeze is cgroup-level — do not hunt for it in the application's async code, and do not expect `.await` discipline to fix it.
+
+**The options, ranked:**
+
+| Option | When |
+|---|---|
+| raise (or remove) the CPU limit, pin `worker_threads` to the request | latency-critical service, trusted node neighbors |
+| cut CPU cost per event (batching, cheaper serialization) | the bill is of your own making |
+| shorten the CFS period (`cpuCFSQuotaPeriod`) | freezes must shrink and thread count ≤ limit (§3.6's caveat) |
+| move CPU-heavy work out of the pod | the burns don't belong next to the latency path at all |
+| ~~sprinkle more `.await`s~~ | never — politeness is invisible to the cgroup (this experiment's headline) |
 
 [↑ Go back to TOC](#table-of-contents)
 

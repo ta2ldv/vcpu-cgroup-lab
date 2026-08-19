@@ -43,6 +43,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 4.3 — tokio kaç worker açar?](#deney-43--tokio-kaç-worker-açar)
   - [Deney 4.4 — event loop'u bloke etmek, ölçülmüş](#deney-44--event-loopu-bloke-etmek-ölçülmüş)
   - [Deney 4.5 — iki thread üstünde bir milyon bekleyen task](#deney-45--iki-thread-üstünde-bir-milyon-bekleyen-task)
+  - [Deney 4.6 — quota altında async](#deney-46--quota-altında-async)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 - [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -1631,6 +1632,90 @@ $ ps -T -p <PID>          # her ölçekte birebir aynı:
 | CPU limitini olay hızıyla ölçekle | dürüst ama para; formül ne kadar olduğunu söyler |
 | bağlantıları pod'lara shard'la | aynı formülün yatay versiyonu |
 | ~~RAM ekle~~ | bekleyen task'lar için darboğaz o değil — satın almadan önce ölç |
+
+## Deney 4.6 — quota altında async
+
+Bölümün kapanış deneyi, iki dünyasını birleştiriyor: Bölüm 2'nin cgroup quota'sı, Bölüm 4'ün async runtime'ıyla buluşuyor. **Yeni kod yok** — mevcut sondlar iki kez koşuyor: önce çıplak, sonra 0.5 vCPU'luk kafeste. Soru: tokio seviyesindeki kibarlık (`.await`'ler, yield'ler) task'ları bir cgroup donmasından koruyabilir mi?
+
+```bash
+# ── faz 1: quota'sız (aynı gün, baseline) ──
+./target/release/02_heartbeat                  # yalnız heartbeat
+./target/release/03_heartbeat_v2 spawn         # kibar burn'ler (batch başına sleep 1ms)
+./target/release/04_heartbeat_v3 spawn         # kibar burn'ler (batch başına yield_now)
+./target/release/05_ioload 10000               # 10k bekleyen task
+./target/release/05_ioload 100000              # 100k bekleyen task
+
+# ── faz 2: shell'i kafese koy, 0.5 vCPU, aynı beş koşu ──
+sudo mkdir /sys/fs/cgroup/lab
+echo $$ | sudo tee /sys/fs/cgroup/lab/cgroup.procs
+echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max
+cat /proc/$$/cgroup                            # 0::/lab
+# ...aynı beş koşu...
+
+# ── temizlik ──
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs
+sudo rmdir /sys/fs/cgroup/lab
+```
+
+Tam koşu (t3.large):
+
+```
+$ ./target/release/02_heartbeat                # ── quota yok
+mode=control   worst heartbeat delay: 1.4 ms
+$ ./target/release/03_heartbeat_v2 spawn
+mode=spawn     worst heartbeat delay: 2.9 ms
+$ ./target/release/04_heartbeat_v3 spawn
+mode=spawn     worst heartbeat delay: 3.8 ms
+$ ./target/release/05_ioload 10000
+10000 task(s): finished in 5.10 s, worst wake-up delay: 5.0 ms
+$ ./target/release/05_ioload 100000
+100000 task(s): finished in 5.41 s, worst wake-up delay: 45.9 ms
+
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # ── 0.5 vCPU
+$ ./target/release/02_heartbeat
+mode=control   worst heartbeat delay: 3.4 ms
+$ ./target/release/03_heartbeat_v2 spawn
+mode=spawn     worst heartbeat delay: 49.0 ms
+$ ./target/release/04_heartbeat_v3 spawn
+mode=spawn     worst heartbeat delay: 55.1 ms
+$ ./target/release/05_ioload 10000
+10000 task(s): finished in 5.11 s, worst wake-up delay: 4.6 ms
+$ ./target/release/05_ioload 100000
+100000 task(s): finished in 8.78 s, worst wake-up delay: 178.0 ms
+```
+
+### Sonuçlar
+
+| Koşu | Quota yok | 0.5 vCPU | Değişim |
+|---|---|---|---|
+| yalnız heartbeat | 1.4 ms | 3.4 ms | ~yok |
+| kibar burn'ler, `sleep` (03) | 2.9 ms | **49.0 ms** | 17× |
+| kibar burn'ler, `yield_now` (04) | 3.8 ms | **55.1 ms** | 14× |
+| 10.000 bekleyen task | 5.0 ms | 4.6 ms | **yok** |
+| 100.000 bekleyen task | 45.9 ms · 5.41 s | **178.0 ms · 8.78 s** | 4× gecikme, koşu %62 uzadı |
+
+### Öğrettikleri
+
+1. **49–55 ms bir imza taşıyor.** §3.6'nın kaynak-B formülünün dönüşü: donma ≈ period'un quota'dan artakalan kısmı — ~50 ms. Kibar burn'ler bütçeyi her pencerenin ilk yarısında harcıyor ve kernel **worker thread'lerin kendisini** donduruyor. Kritik nokta: **donmuş bir thread'in içinde `.await` teslimi değersizdir** — devri alacak koşan worker kalmamıştır. Bu, Deney 4.4'ün ayna görüntüsü: orada kernel sağlıklıydı, tokio katı kilitliydi; burada tokio katı kibar, kernel katı (cgroup) herkesi donduruyor. **İki katmanlı scheduler yığınında çare, arızalanan katta yaşamak zorundadır — tokio'nun kibarlığı cgroup'a görünmez.**
+2. **Quota beklemeyi cezalandırmaz.** Yalnız-heartbeat ve 10 bin task koşuları limiti hiç hissetmedi: bekleyen task CPU tüketmez, quota da yalnız *tüketilen* CPU'yu sayar. Bekleme, kafeste bile bedavadır.
+3. **100 bin'de uyanma faturası limite çarptı.** ~1 M uyanma/sn'lik muhasebe ~1 vCPU ister; kafes 0.5 veriyor → her pencerede throttle: koşu 5.4 → 8.8 s'ye uzadı (istediğinin yarısını almanın aritmetiği) ve donma zincirleri 178 ms'lik tepeler üretti. Deney 4.5'in boyutlandırma formülü son terimini kazandı: **olay/sn × olay başına maliyet, *limitin* içine sığmalı.**
+4. **Bölümün özet cümlesi:** async seni quota'dan korumaz; yalnızca donmanın faturasını *process'teki herkese aynı anda* kestirir — 100.000 task'lık concurrency bile tek bir `cpu.max` satırının rehinesidir.
+
+### Problem → yaklaşım → seçenekler (4.6)
+
+**Karşılık geldiği gerçek dünya problemi:** CPU limitli bir pod, *tüm* isteklere aynı anda vuran, ritmik (~her period'da bir), onlarca ms'lik latency tepeleri gösterir; ortalama CPU, limite eşit bir platoda oturur. Klasik k8s postmortem'i: "p99 her 100 ms'de bir sıçrıyor, CPU grafiği %50'de dümdüz."
+
+**Nasıl yaklaşılır:** tepeleri `container_cpu_cfs_throttled_periods_total` ile korele et (pod dünyasının `nr_throttled`'ı). Birlikte yürüyorlarsa donma cgroup seviyesindedir — onu uygulamanın async kodunda arama ve `.await` disiplininden çare bekleme.
+
+**Seçenekler, sıralı:**
+
+| Seçenek | Ne zaman |
+|---|---|
+| CPU limitini yükselt (ya da kaldır), `worker_threads`'i request'e sabitle | latency-kritik servis, node komşularına güven |
+| olay başına CPU maliyetini düşür (batching, ucuz serialization) | fatura kendi elinin ürünüyse |
+| CFS period'unu kısalt (`cpuCFSQuotaPeriod`) | donmalar küçülmeli ve thread sayısı ≤ limit (§3.6'nın şerhi) |
+| CPU-ağır işi pod'un dışına taşı | burn'lerin latency yolunun yanında zaten işi yoksa |
+| ~~daha çok `.await` serpiştir~~ | asla — kibarlık cgroup'a görünmez (bu deneyin manşeti) |
 
 [↑ Go back to TOC](#i̇çindekiler)
 
