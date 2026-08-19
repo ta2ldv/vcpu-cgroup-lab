@@ -39,6 +39,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 3.7 — "kaç CPU var?" sorusuna kim dürüst cevap verir](#deney-37--kaç-cpu-var-sorusuna-kim-dürüst-cevap-verir)
 - [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-yakında)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
+- [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
 ## Müfredat
 
@@ -49,6 +50,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 | 3 | Rust ile yük üreteci | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | ✅ |
 | 4 | Async Rust (tokio) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | 🔜 |
 | 5 | Kubernetes requests/limits | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
+| 6 | Performans lab'ı (Redis & Dragonfly) | Zıt mimarili iki engine için *doğru* CPU kısıtları ne — VM'de ve OpenShift'te, ölçümle kanıtlı? | 🔜 |
 
 ---
 
@@ -1026,8 +1028,35 @@ available_parallelism: 1
 
 # Bölüm 4 — Async Rust: tokio ve vCPU *(yakında)*
 
-Async bölümü: tokio'nun runtime modeli (çok sayıda hafif task taşıyan az sayıda OS worker thread'i), worker pool'un `std::thread::available_parallelism()` ile nasıl boyutlandığı, o çağrının limitli bir cgroup içinde gerçekte ne raporladığı ve Bölüm 3 deneylerinin async karşılıkları — aynı quota'lar altında CPU-bound vs IO-bound task'lar. Cargo burada geri döner (tokio dış bir crate).
+Async bölümü, gerçek bir teslimatla: Bölüm 3'ün burner'ları *sync* dünyayı ölçtü; burada async karşılıklarını inşa ediyoruz — **tokio tabanlı bir RESP yük üreteci** (Redis protokolü konuşan bir client: sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla). Async'in ekmeğini gerçekten kazandığı yer network IO'dur; araç ile ders burada çakışır. Yol boyunca: tokio'nun runtime modeli (çok sayıda hafif task taşıyan az sayıda OS worker thread'i), limitli bir cgroup içinde kaç worker açtığı — varsayımla değil ölçümle — ve aynı quota'lar altında CPU-bound vs IO-bound task'lar. Cargo burada geri döner (tokio dış bir crate).
 
 # Bölüm 5 — Kubernetes requests & limits *(yakında)*
 
-Sentez: Bölüm 3–4'teki her iş yükü — sync thread'ler ve async task'lar — OpenShift'te pod olarak deploy edilir, deney matrisi bu kez YAML ile tekrar oynanır. kubelet'in kurduğu cgroup ağacında gezinti (`kubepods.slice/...`), `requests`/`limits`'in Bölüm 2'deki dosyalara birebir eşlenmesi, gerçek pod'larda CFS throttling gözlemi ve her request/limit kombinasyonunun her iş yükü tipi için *faydalı / zararlı / etkisiz* olarak yargılanması.
+Mekanizma, uçtan uca: Bölüm 3'ün burner'ları OpenShift'te pod olarak (statik musl binary, `FROM scratch` imaj), deney matrisi bu kez YAML ile. kubelet'in kurduğu cgroup ağacında gezinti (`kubepods.slice/...`), `requests`/`limits`'in Bölüm 2'deki dosyalara birebir eşlenmesi, elle ölçtüğümüz hücrenin (`echo "50000 100000" > cpu.max` → 241 M iter/s) Kubernetes'in `limits: cpu: 500m`'den kurduğu hücreyle aynı olduğunun teyidi ve her request/limit kombinasyonunun her iş yükü tipi için *faydalı / zararlı / etkisiz* olarak yargılanması.
+
+# Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma *(yakında)*
+
+Hasat bölümü: gerçek engine'ler, gerçek yük, ölçülmüş boyutlandırma reçeteleri — VM'de elle kurulan cgroup'larla, OpenShift'te requests/limits ile. Zıt mimarili iki engine — Redis (tek thread'li event loop ≈ bizim 1-thread satırı) ve Dragonfly (thread-per-core ≈ bizim 8-thread satırı) — aynı yük altında, CPU kısıtları taranarak. Birbirini çapraz doğrulayan iki alet:
+
+- **Tip A:** Bölüm 4'te yazdığımız tokio RESP client'ı — *uygulamanın gerçek write path'ini* modeller, yük deseni tamamen kontrolümüzde.
+- **Tip B:** `memtier_benchmark` (Redis Ltd.'nin standart benchmark imajı) — dünyanın güvendiği endüstri referansı.
+
+### Test topolojisi: ölçen asla aç kalmamalı
+
+CPU'su biten bir yük üreteci, kendi acısını server'ın latency'si diye raporlar. Bu yüzden client, iki ortamda da server'dan **ayrı donanımda** yaşar:
+
+```
+VM senaryosu (elle cgroup):            OpenShift senaryosu (requests/limits):
+
+  VM 1                 VM 2              node 1                node 2
+┌─────────────┐     ┌──────────────┐   ┌─────────────┐     ┌──────────────┐
+│ RESP client │ ──> │ redis /      │   │ client pod  │ ──> │ server pod   │
+│ / memtier   │     │ dragonfly    │   │ (bol kaynak,│     │ (test edilen │
+│ (limitsiz)  │     │ (cpu.max     │   │  limitsiz)  │     │  requests/   │
+│             │     │  taranır)    │   │             │     │  limits)     │
+└─────────────┘     └──────────────┘   └─────────────┘     └──────────────┘
+```
+
+Sabitler ve değişkenler sıkı ayrılır: network yolu sabit (aynı VM çifti / aynı node çifti, aynı AZ), client hep kısıtsız ve **koşudan koşuya değişen tek şey server'ın CPU kısıtı**. Her koşu aynı üçlüyü kaydeder: client tarafında p99, client tarafında throughput, server tarafında `cpu.stat` / `container_cpu_cfs_throttled_periods_total`. Sonuncusuyla ilkinin korelasyonu, bu lab'ın imza hareketidir.
+
+Teslimat: ölçülmüş boyutlandırma reçeteleri — "şu yük deseni için Redis'e *şu* request/limit, Dragonfly'a *bu*; işte kanıtlayan sayılar."

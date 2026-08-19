@@ -39,6 +39,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 3.7 — who answers "how many CPUs?" honestly](#experiment-37--who-answers-how-many-cpus-honestly)
 - [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-coming-soon)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
+- [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
 
 ## Curriculum
 
@@ -49,6 +50,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 | 3 | Rust load generator | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | ✅ |
 | 4 | Async Rust (tokio) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | 🔜 |
 | 5 | Kubernetes requests/limits | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
+| 6 | Performance lab (Redis & Dragonfly) | What are the *right* CPU constraints for two opposite engine architectures — proven by measurement, on VM and OpenShift? | 🔜 |
 
 ---
 
@@ -1026,8 +1028,35 @@ available_parallelism: 1
 
 # Part 4 — Async Rust: tokio and the vCPU *(coming soon)*
 
-The async chapter: tokio's runtime model (a few OS worker threads carrying many lightweight tasks), how the worker pool is sized from `std::thread::available_parallelism()`, what that call actually reports inside a limited cgroup, and async counterparts of the Part 3 experiments — CPU-bound vs IO-bound tasks under the same quotas. Cargo returns here (tokio is an external crate).
+The async chapter, with a real deliverable: the Part 3 burners measured the *sync* world; here we build their async counterpart — a **tokio-based RESP load generator** (a client that speaks the Redis protocol: pipelined SET/GET at a fixed rate, reporting p50/p99 latency). Network IO is where async actually earns its keep, so the tool and the lesson coincide. Along the way: tokio's runtime model (a few OS worker threads carrying many lightweight tasks), how many workers it starts inside a limited cgroup — measured, not assumed — and CPU-bound vs IO-bound tasks under the same quotas. Cargo returns here (tokio is an external crate).
 
 # Part 5 — Kubernetes requests & limits *(coming soon)*
 
-The synthesis: every workload from Parts 3–4 — sync threads and async tasks — deployed as pods on OpenShift, with the experiment matrix replayed in YAML. Walking the cgroup tree that kubelet builds (`kubepods.slice/...`), mapping `requests`/`limits` to the exact files from Part 2, observing CFS throttling on real pods, and judging each request/limit combination as *helpful, harmful, or neutral* for each workload type.
+The mechanism, end to end: the Part 3 burners deployed as pods on OpenShift (a static musl binary in a `FROM scratch` image), with the experiment matrix replayed in YAML. Walking the cgroup tree that kubelet builds (`kubepods.slice/...`), mapping `requests`/`limits` to the exact files from Part 2, confirming that the cell we measured by hand (`echo "50000 100000" > cpu.max` → 241 M iter/s) is the same cell Kubernetes builds from `limits: cpu: 500m`, and judging each request/limit combination as *helpful, harmful, or neutral* for each workload type.
+
+# Part 6 — Performance lab: sizing Redis & Dragonfly *(coming soon)*
+
+The payoff chapter: real engines, real load, measured sizing recipes — on the VM with hand-set cgroups, and on OpenShift with requests/limits. Two engines with opposite architectures — Redis (single-threaded event loop ≈ our 1-thread row) and Dragonfly (thread-per-core ≈ our 8-thread row) — put under the same load while their CPU constraints are swept. Two instruments, cross-checking each other:
+
+- **Type A:** our own tokio RESP client from Part 4 — models the *application's actual write path*, workload shape fully under our control.
+- **Type B:** `memtier_benchmark` (Redis Ltd.'s standard benchmark image) — the industry reference the world trusts.
+
+### Test topology: the measurer must never starve
+
+A load generator that runs out of CPU reports its own agony as the server's latency. The client therefore always lives on separate hardware from the server, in both environments:
+
+```
+VM scenario (cgroup by hand):          OpenShift scenario (requests/limits):
+
+  VM 1                 VM 2              node 1                node 2
+┌─────────────┐     ┌──────────────┐   ┌─────────────┐     ┌──────────────┐
+│ RESP client │ ──> │ redis /      │   │ client pod  │ ──> │ server pod   │
+│ / memtier   │     │ dragonfly    │   │ (generous   │     │ (requests/   │
+│ (no limits) │     │ (cpu.max     │   │  resources, │     │  limits under│
+│             │     │  swept)      │   │  no limits) │     │  test)       │
+└─────────────┘     └──────────────┘   └─────────────┘     └──────────────┘
+```
+
+Constants and variables, strictly separated: the network path stays fixed (same VM pair / same node pair, same AZ), the client stays unconstrained, and **the only thing that changes between runs is the server's CPU constraint**. Every run records the same triple: client-side p99, client-side throughput, server-side `cpu.stat` / `container_cpu_cfs_throttled_periods_total`. The correlation between the last one and the first one is the lab's signature move.
+
+Deliverable: measured sizing recipes — "for this workload shape, give Redis *this* request/limit and Dragonfly *that* one, and here are the numbers that prove it."
