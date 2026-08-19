@@ -37,7 +37,9 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 3.5 — thread × quota matrisi](#deney-35--thread--quota-matrisi)
   - [Deney 3.6 — stall'lar: matrisin göremediği acı](#deney-36--stalllar-matrisin-göremediği-acı)
   - [Deney 3.7 — "kaç CPU var?" sorusuna kim dürüst cevap verir](#deney-37--kaç-cpu-var-sorusuna-kim-dürüst-cevap-verir)
-- [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-yakında)
+- [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-devam-ediyor)
+  - [4.1 Cargo'nun dönüşü — proje kurulumu](#41-cargonun-dönüşü--proje-kurulumu)
+  - [Deney 4.2 — tokio kaç worker açar?](#deney-42--tokio-kaç-worker-açar)
 - [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
 - [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -232,6 +234,67 @@ Period'u sen seçersin (kernel 1 ms – 1 s kabul eder; 100 ms hem kernel'in hem
 ```
 
 `top` böyle bir process'i %50 gösterir — ama gerçek şudur: *zamanın yarısında tam hızda* koşuyor.
+
+Period'dan *büyük* bir quota nasıl sığar — mesela `150000 100000`, 100 ms'lik pencerede 150 ms? Çünkü **quota CPU başına değil, cgroup'un tüm CPU'lardaki toplamına sayılır**. 2 vCPU'lu makinede bir pencere en fazla 2 × 100 = 200 ms CPU zamanı sunar; aynı anda koşan iki thread 150 ms'lik bütçeyi 75 ms duvar saatinde yakar:
+
+```
+pencere: |———————— 100 ms duvar saati ————————|
+CPU 0:   [■■■■■■■ 75 ms koştu ■■■■■■■][ donuk ]
+CPU 1:   [■■■■■■■ 75 ms koştu ■■■■■■■][ donuk ]
+                                       toplam: 75+75 = 150 ms — bütçe bitti
+```
+
+Yani `150000 100000` = 150/100 = **1.5 vCPU'luk zaman hakkı**. Ezber kalıbı: **soldakini sağdakine böl, vCPU sayısını bul.**
+
+#### Tavan: sol değerin anlamlı maksimumu nedir?
+
+İsimlendirme, bir kez ve net — `a b` girdisinde:
+
+```
+a = quota   → BÜTÇE: cgroup'un pencere başına harcayabileceği CPU zamanı (µs)
+b = period  → PENCERE: bir muhasebe turunun duvar saati uzunluğu (µs)
+```
+
+Bütçe **logical CPU'larda** harcanır — kernel'in üstüne iş dizdiği birimler. Sayıları donanımdan gelir:
+
+```
+logical CPU = physical core × SMT katsayısı
+```
+
+(§1.2'den SMT özeti: tek fiziksel core'un 2+ komple register seti taşıması; OS onu 2+ CPU olarak görür, execution devreleri ortaktır. x86'da katsayı 2; IBM POWER'da 4–8; Apple M / Graviton'da SMT yok, katsayı 1.)
+
+Her logical CPU bir pencerede en fazla `b` µs katkı verebilir — duvar saatinden fazla koşamaz. Tavan buradan:
+
+```
+pencere başına harcanabilir maks quota:   a_max = b × logical CPU sayısı
+```
+
+Bu lab'ın t3.large'ında, çizimle:
+
+```
+                    ┌─ physical core 0 ─┐
+                    │  HT-A       HT-B  │        1 core × SMT 2 = 2 logical CPU
+                    └───┬───────────┬───┘
+                        │           │
+pencere (b = 100 ms):   │           │
+CPU 0 = HT-A:  [■■■ en çok 100 ms ■■■]  ┐
+CPU 1 = HT-B:  [■■■ en çok 100 ms ■■■]  ┴→  a_max = 2 × 100 ms = 200 ms
+```
+
+Sayısal örnekler, hepsinde `b = 100000` (100 ms):
+
+| Makine | core | SMT | logical CPU | tavan `a_max` | yani bunun ötesi anlamsız: |
+|---|---|---|---|---|---|
+| t3.large (bu lab) | 1 | 2 | 2 | 200 ms | `200000 100000` |
+| 4 core SMT'li Xeon | 4 | 2 | 8 | 800 ms | `800000 100000` |
+| Graviton, 8 core | 8 | 1 | 8 | 800 ms | `800000 100000` |
+| POWER9, 4 core SMT8 | 4 | 8 | 32 | 3200 ms | `3200000 100000` |
+
+Formüle üç dipnot:
+
+1. Tavanın **üstünde** quota yazmak geçerlidir — kernel t3'te `800000 100000`'i kabul eder — ama grup fiziksel olarak 200 ms'den fazlasını harcayamaz; tavanın ötesi `max` gibi davranır.
+2. Çarpan, **bu cgroup'un erişebildiği** logical CPU sayısıdır: `cpuset.cpus 0` pinlemesi tavanı makinede ne olursa olsun `b × 1`'e indirir.
+3. Tavan bir **zaman** tavanıdır, **iş** tavanı değil: SMT çiftinde harcanan 200 ms ~1.65 CPU'luk iş üretir, 2 değil (§3.4/§3.5) — ms'ler eşittir, arkalarındaki silikon değildir.
 
 ### `cgroup.procs` — mahkûmlar
 
@@ -1026,9 +1089,122 @@ available_parallelism: 1
 3. **1.5 vCPU sürprizi: Rust *aşağı* yuvarlar.** quota/period = 1.5 → cevap 1 (tabanı 1). Bilinçli muhafazakârlık: 1.5 CPU'luk bütçede iki işçi ikisi birden throttle yer; tek işçi temiz akar, 0.5'lik hak boşta kalır. Utilization değil latency kayırılmış.
 4. **Tuzak yalnız bazı dillerde öldü.** `nproc` tabanlı script'ler, düz C, (automaxprocs'suz) Go `GOMAXPROCS`'u, eski JVM'ler hâlâ node sayısını görür — "`limit: 2` altında 64 worker" kazası karışık dilli filolarda gerçekliğini koruyor. tokio'nun ne yaptığını Bölüm 4 *ölçecek*, varsaymayacak.
 
-# Bölüm 4 — Async Rust: tokio ve vCPU *(yakında)*
+# Bölüm 4 — Async Rust: tokio ve vCPU *(devam ediyor)*
 
 Async bölümü, gerçek bir teslimatla: Bölüm 3'ün burner'ları *sync* dünyayı ölçtü; burada async karşılıklarını inşa ediyoruz — **tokio tabanlı bir RESP yük üreteci** (Redis protokolü konuşan bir client: sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla). Async'in ekmeğini gerçekten kazandığı yer network IO'dur; araç ile ders burada çakışır. Yol boyunca: tokio'nun runtime modeli (çok sayıda hafif task taşıyan az sayıda OS worker thread'i), limitli bir cgroup içinde kaç worker açtığı — varsayımla değil ölçümle — ve aynı quota'lar altında CPU-bound vs IO-bound task'lar. Cargo burada geri döner (tokio dış bir crate).
+
+## 4.1 Cargo'nun dönüşü — proje kurulumu
+
+Bölüm 1–3 std dışında hiçbir şeye ihtiyaç duymadı, düz `rustc -O` yetti. tokio dış bir crate — cargo'nun var oluş sebebi tam bu: dependency'yi (ve onun dependency'lerini) crates.io'dan indirir, derler, cache'ler.
+
+```bash
+cargo new tokioburn && cd tokioburn
+```
+
+`Cargo.toml`'da `[dependencies]` altına:
+
+```toml
+tokio = { version = "1", features = ["full"] }
+```
+
+(`features = ["full"]` tokio'nun tüm bileşenlerini açar — runtime, net, time. Production build'leri seçici davranır; lab için full pratik.) İlk `cargo build --release` tokio derlenirken 1-2 dakika sürer; sonrakiler saniyeler. Proje bu repo'da: [`tokioburn/`](tokioburn/).
+
+## Deney 4.2 — tokio kaç worker açar?
+
+tokio'nun multi-thread runtime'ı, çok sayıda hafif task'ı az sayıda OS **worker thread**'i üstünde taşır. O havuzun boyutlandırması, Deney 3.7'nin pratiğe döküldüğü yer: tokio `available_parallelism()`'i mi izliyor — yani cgroup quota'larını görüyor mu — yoksa makineyi mi okuyor? Varsayımla değil, ölçümle.
+
+Sonda ([`tokioburn/src/main.rs`](tokioburn/src/main.rs)):
+
+```rust
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    println!("available_parallelism: {:?}", thread::available_parallelism());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    println!("tokio workers: {}  (PID: {})", rt.metrics().num_workers(), std::process::id());
+
+    rt.block_on(async {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    });
+}
+```
+
+Yeni kavramlar, satır satır:
+
+| Kod | Ne yapıyor |
+|---|---|
+| `Builder::new_multi_thread()...build()` | tokio **runtime**'ını kurar: worker thread havuzu + task scheduler'ı. `#[tokio::main]` makrosu bunu görünmez yapar; incelemek için açık kurduk. Worker sayısı vermedik — default'un seçimi *deneyin kendisi*. |
+| `rt.metrics().num_workers()` | Runtime'a kaç worker thread açtığını sorar — process içindeki şahit. |
+| `rt.block_on(async { ... })` | Sync dünya (`main`) ile async dünya arasındaki kapı: runtime'a ilk task'ını verir ve o task bitene kadar `main`'i bloklar. |
+| `tokio::time::sleep(...).await` | tokio'nun uykusu. `.await` = "ben beklerken worker'ı bırak — başka task koşabilsin." (`thread::sleep` worker'ı rehin alırdı; o fark Deney 4.3'ün konusu.) Burada tek işi process'i 15 sn hayatta tutmak — dışarıdan incelenebilsin diye. |
+
+Koşular — çıplak, sonra cgroup içinde 0.5 ve 1.5 vCPU (kafes düzeni §3.5'teki gibi). Program uyurken ikinci terminal **dış şahide** bakar:
+
+```bash
+./target/release/tokioburn
+ps -T -p <PID>        # process'in tüm thread'leri, isimleriyle
+```
+
+Gerçek çıktı (t3.large, çıplak):
+
+```
+$ ./target/release/tokioburn
+available_parallelism: Ok(2)
+tokio workers: 2  (PID: 16590)
+
+$ ps -T -p 16590
+    PID    SPID TTY          TIME CMD
+  16590   16590 pts/1    00:00:00 tokioburn          ← main thread (block_on'da park halinde)
+  16590   16591 pts/1    00:00:00 tokio-rt-worker    ← worker 1
+  16590   16592 pts/1    00:00:00 tokio-rt-worker    ← worker 2
+```
+
+Bakmaya değer iki ayrıntı: tokio thread'lerine **isim verir** (`tokio-rt-worker`) — production'da `ps -T`/`top -H` teşhisini keyifli yapar; ve process toplam 3 thread tutar — 1 main (`block_on`'da bloklu) + 2 worker.
+
+Cgroup koşuları (aynı sond, kafesteki shell):
+
+```
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max     # 0.5 vCPU
+$ ./target/release/tokioburn
+available_parallelism: Ok(1)
+tokio workers: 1  (PID: 16611)
+$ ps -T -p 16611
+  16611   16611  tokioburn
+  16611   16612  tokio-rt-worker          ← artık tek worker
+
+$ echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # 1.5 vCPU
+$ ./target/release/tokioburn
+available_parallelism: Ok(1)
+tokio workers: 1  (PID: 16841)
+```
+
+### Sonuçlar
+
+| Ortam | `available_parallelism()` | tokio workers |
+|---|---|---|
+| çıplak | 2 | 2 |
+| quota 0.5 vCPU | 1 | 1 |
+| quota 1.5 vCPU | 1 | **1** — yine floor |
+
+### Öğrettikleri
+
+1. **tokio havuzunu `available_parallelism()`'den boyutlandırır** — Deney 3.7'nin tüm bulguları buraya aktarılır: quota-aware, affinity-aware, floor semantiği.
+2. **"Quota-aware" = k8s *limit*'i demek, asla *request* değil.** `limits: cpu` → `cpu.max` olur, runtime okuyabilir; `requests: cpu` → `cpu.weight` olur — bir çekişme payıdır, ondan CPU sayısı türetilemez bile. Runtime request'i göremez:
+
+| Pod ayarı (64 vCPU'lu node) | tokio workers |
+|---|---|
+| `limit: 500m` | 1 |
+| `limit: 2` | 2 |
+| `limit: 1500m` | 1 (floor) |
+| **limit yok, sadece `request: 2`** | **64** |
+
+3. **Yakalayıcı satır sonuncusu.** "Latency-kritik servise limit koyma" stratejisinin gizli maliyeti: okunacak quota yoksa runtime node'un CPU sayısına düşer ve 64 worker açar. Sakin node'da bu bedava burst kapasitesidir; kalabalık node'da `cpu.weight` o 64 thread'i ~2 CPU'luk paya sıkıştırır — run queue kalabalığı, §3.6'nın A-kaynağı stall'ları. Limitsiz koşarken çare: worker sayısını elle ver (`Builder::worker_threads(n)` ya da `TOKIO_WORKER_THREADS` env var), request'ine yakın boyutlandır.
 
 # Bölüm 5 — Kubernetes requests & limits *(yakında)*
 

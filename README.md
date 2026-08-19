@@ -37,7 +37,9 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 3.5 — the thread × quota matrix](#experiment-35--the-thread--quota-matrix)
   - [Experiment 3.6 — stalls: the pain the matrix cannot see](#experiment-36--stalls-the-pain-the-matrix-cannot-see)
   - [Experiment 3.7 — who answers "how many CPUs?" honestly](#experiment-37--who-answers-how-many-cpus-honestly)
-- [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-coming-soon)
+- [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-in-progress)
+  - [4.1 Cargo returns — project setup](#41-cargo-returns--project-setup)
+  - [Experiment 4.2 — how many workers does tokio start?](#experiment-42--how-many-workers-does-tokio-start)
 - [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
 - [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -232,6 +234,67 @@ The period is yours to choose (kernel accepts 1 ms – 1 s; 100 ms is the defaul
 ```
 
 `top` shows such a process at 50 % — but the truth is it runs at *full speed half the time*.
+
+How can a quota *larger* than the period fit — say `150000 100000`, 150 ms inside a 100 ms window? Because **the quota is charged against the cgroup's total across all CPUs**, not per CPU. On a 2-vCPU machine one window offers up to 2 × 100 = 200 ms of CPU time; two threads running simultaneously burn 150 ms of budget in 75 ms of wall-clock:
+
+```
+window:  |———————— 100 ms wall-clock ————————|
+CPU 0:   [■■■■■■■ ran 75 ms ■■■■■■■][ frozen ]
+CPU 1:   [■■■■■■■ ran 75 ms ■■■■■■■][ frozen ]
+                                     total: 75+75 = 150 ms — budget spent
+```
+
+So `150000 100000` = 150/100 = **1.5 vCPUs' worth of time**. The rule of thumb: **divide the left number by the right one and you get the vCPU count.**
+
+#### The ceiling: what is the largest useful left value?
+
+Naming, once and for all — an `a b` entry means:
+
+```
+a = quota   → the BUDGET: CPU-time (µs) the cgroup may spend per window
+b = period  → the WINDOW: wall-clock length (µs) of one accounting round
+```
+
+The budget is spent on **logical CPUs** — the things the kernel schedules onto. Their count comes from the hardware:
+
+```
+logical CPUs = physical cores × SMT factor
+```
+
+(SMT recap from §1.2: one physical core holding 2+ full register sets, so the OS sees it as 2+ CPUs; the execution machinery is shared. x86 SMT factor is 2; IBM POWER goes 4–8; Apple M / Graviton have no SMT, factor 1.)
+
+Each logical CPU can contribute at most `b` µs of CPU-time per window — it cannot run more than wall-clock. Hence the ceiling:
+
+```
+max spendable quota per window:   a_max = b × logical CPUs
+```
+
+On this lab's t3.large, drawn out:
+
+```
+                    ┌─ physical core 0 ─┐
+                    │  HT-A       HT-B  │        1 core × SMT 2 = 2 logical CPUs
+                    └───┬───────────┬───┘
+                        │           │
+window (b = 100 ms):    │           │
+CPU 0 = HT-A:  [■■■ up to 100 ms ■■■]  ┐
+CPU 1 = HT-B:  [■■■ up to 100 ms ■■■]  ┴→  a_max = 2 × 100 ms = 200 ms
+```
+
+Worked examples, `b = 100000` (100 ms) everywhere:
+
+| Machine | cores | SMT | logical CPUs | ceiling `a_max` | i.e. `cpu.max` beyond which more is meaningless |
+|---|---|---|---|---|---|
+| t3.large (this lab) | 1 | 2 | 2 | 200 ms | `200000 100000` |
+| 4-core SMT Xeon | 4 | 2 | 8 | 800 ms | `800000 100000` |
+| Graviton, 8 cores | 8 | 1 | 8 | 800 ms | `800000 100000` |
+| POWER9, 4 cores SMT8 | 4 | 8 | 32 | 3200 ms | `3200000 100000` |
+
+Three footnotes to the formula:
+
+1. Writing a quota **above** the ceiling is legal — the kernel accepts `800000 100000` on the t3 — but the group physically cannot spend more than 200 ms, so anything past the ceiling behaves like `max`.
+2. The multiplier is the logical CPUs **this cgroup can reach**: a `cpuset.cpus 0` pin shrinks the ceiling to `b × 1` no matter what the machine has.
+3. The ceiling is a **time** ceiling, not a **work** ceiling: 200 ms spent on an SMT pair produces ~1.65 CPUs' worth of work, not 2 (§3.4/§3.5) — the ms are equal, the silicon behind them is not.
 
 ### `cgroup.procs` — the inmates
 
@@ -1026,9 +1089,122 @@ available_parallelism: 1
 3. **The 1.5-vCPU surprise: Rust rounds *down*.** quota/period = 1.5 → answer 1 (with a floor of 1). Conservative by design: two workers on 1.5 CPUs of budget would both throttle; one worker runs clean and leaves 0.5 unused. Latency is favored over utilization.
 4. **The trap is dead only in some languages.** `nproc`-based scripts, plain C, Go's `GOMAXPROCS` (without automaxprocs), older JVMs still see the node's count — the "64 workers under `limit: 2`" incident remains real in mixed-language fleets. What tokio does, Part 4 will *measure*, not assume.
 
-# Part 4 — Async Rust: tokio and the vCPU *(coming soon)*
+# Part 4 — Async Rust: tokio and the vCPU *(in progress)*
 
 The async chapter, with a real deliverable: the Part 3 burners measured the *sync* world; here we build their async counterpart — a **tokio-based RESP load generator** (a client that speaks the Redis protocol: pipelined SET/GET at a fixed rate, reporting p50/p99 latency). Network IO is where async actually earns its keep, so the tool and the lesson coincide. Along the way: tokio's runtime model (a few OS worker threads carrying many lightweight tasks), how many workers it starts inside a limited cgroup — measured, not assumed — and CPU-bound vs IO-bound tasks under the same quotas. Cargo returns here (tokio is an external crate).
+
+## 4.1 Cargo returns — project setup
+
+Parts 1–3 needed nothing beyond std, so plain `rustc -O` was enough. tokio is an external crate — this is what cargo exists for: it downloads the dependency (and its dependencies) from crates.io, compiles and caches them.
+
+```bash
+cargo new tokioburn && cd tokioburn
+```
+
+Add to `Cargo.toml` under `[dependencies]`:
+
+```toml
+tokio = { version = "1", features = ["full"] }
+```
+
+(`features = ["full"]` enables all tokio components — runtime, net, time. Production builds pick selectively; for a lab, full is practical.) First `cargo build --release` takes a minute or two while tokio compiles; subsequent builds are seconds. The project lives at [`tokioburn/`](tokioburn/) in this repo.
+
+## Experiment 4.2 — how many workers does tokio start?
+
+tokio's multi-thread runtime carries many lightweight tasks on a few OS **worker threads**. The sizing of that pool is exactly where Experiment 3.7 becomes practical: does tokio follow `available_parallelism()` — and therefore see cgroup quotas — or does it read the machine? Measured, not assumed.
+
+The probe ([`tokioburn/src/main.rs`](tokioburn/src/main.rs)):
+
+```rust
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    println!("available_parallelism: {:?}", thread::available_parallelism());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    println!("tokio workers: {}  (PID: {})", rt.metrics().num_workers(), std::process::id());
+
+    rt.block_on(async {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    });
+}
+```
+
+New concepts, line by line:
+
+| Code | What it does |
+|---|---|
+| `Builder::new_multi_thread()...build()` | Constructs the tokio **runtime**: a worker-thread pool plus a task scheduler. The `#[tokio::main]` macro does this invisibly; we build it explicitly to inspect it. No worker count given — the default choice *is* the experiment. |
+| `rt.metrics().num_workers()` | Asks the runtime itself how many worker threads it started — the witness inside the process. |
+| `rt.block_on(async { ... })` | The gate between the sync world (`main`) and the async world: hands the runtime its first task and blocks `main` until that task completes. |
+| `tokio::time::sleep(...).await` | tokio's sleep. `.await` means "while I wait, release the worker — other tasks may run." (`thread::sleep` would hold the worker hostage; that difference is Experiment 4.3.) Here it just keeps the process alive 15 s so it can be inspected from outside. |
+
+Runs — bare, then inside a cgroup at 0.5 and 1.5 vCPU (cage setup as in §3.5). While the program sleeps, a second terminal checks the **external witness**:
+
+```bash
+./target/release/tokioburn
+ps -T -p <PID>        # every thread of the process, with names
+```
+
+Real output (t3.large, bare):
+
+```
+$ ./target/release/tokioburn
+available_parallelism: Ok(2)
+tokio workers: 2  (PID: 16590)
+
+$ ps -T -p 16590
+    PID    SPID TTY          TIME CMD
+  16590   16590 pts/1    00:00:00 tokioburn          ← main thread (parked in block_on)
+  16590   16591 pts/1    00:00:00 tokio-rt-worker    ← worker 1
+  16590   16592 pts/1    00:00:00 tokio-rt-worker    ← worker 2
+```
+
+Two details worth the look: tokio **names** its threads (`tokio-rt-worker`), which makes `ps -T`/`top -H` diagnosis in production pleasant; and the process holds 3 threads total — 1 main (blocked in `block_on`) + 2 workers.
+
+The cgroup runs (same probe, caged shell):
+
+```
+$ echo "50000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max     # 0.5 vCPU
+$ ./target/release/tokioburn
+available_parallelism: Ok(1)
+tokio workers: 1  (PID: 16611)
+$ ps -T -p 16611
+  16611   16611  tokioburn
+  16611   16612  tokio-rt-worker          ← a single worker now
+
+$ echo "150000 100000" | sudo tee /sys/fs/cgroup/lab/cpu.max    # 1.5 vCPU
+$ ./target/release/tokioburn
+available_parallelism: Ok(1)
+tokio workers: 1  (PID: 16841)
+```
+
+### Results
+
+| Environment | `available_parallelism()` | tokio workers |
+|---|---|---|
+| bare | 2 | 2 |
+| quota 0.5 vCPU | 1 | 1 |
+| quota 1.5 vCPU | 1 | **1** — floor, again |
+
+### What it teaches
+
+1. **tokio sizes its pool from `available_parallelism()`** — so everything Experiment 3.7 established transfers: quota-aware, affinity-aware, floor semantics.
+2. **"Quota-aware" means the k8s *limit*, never the *request*.** `limits: cpu` becomes `cpu.max`, which the runtime can read; `requests: cpu` becomes `cpu.weight` — a contention share from which no CPU count can even be derived. The runtime cannot see requests:
+
+| Pod setting (64-vCPU node) | tokio workers |
+|---|---|
+| `limit: 500m` | 1 |
+| `limit: 2` | 2 |
+| `limit: 1500m` | 1 (floor) |
+| **no limit, only `request: 2`** | **64** |
+
+3. **The last row is the catch.** The "no limits for latency-critical services" strategy has a hidden cost: with no quota to read, the runtime falls back to the node's CPU count and starts 64 workers. On a quiet node that's free burst capacity; on a busy node, `cpu.weight` squeezes those 64 threads into a ~2-CPU share — run-queue crowding, §3.6's source-A stalls. The cure when running limitless: set the worker count explicitly (`Builder::worker_threads(n)` or the `TOKIO_WORKER_THREADS` env var), sized near your request.
 
 # Part 5 — Kubernetes requests & limits *(coming soon)*
 
