@@ -1908,6 +1908,25 @@ one hump (healthy):            two humps (two regimes):
 
 A throttled pod produces exactly the two-humped kind: most requests fast, a separate population stuck behind `cpu.max` freezes. p50 says "all fine"; the histogram shows the second society. That picture is what §3.6 promised and Part 7 will hunt for.
 
+### Design logic: how the client applies all this
+
+Build order — two steps, deliberately:
+
+| Step | Connections | What it teaches |
+|---|---|---|
+| first version (§5.4) | **1 connection**, one task | the protocol + async IO basics, in a simplified world |
+| final version (§5.5) | **N concurrent connections** — each connection one `tokio::spawn` task | real load; Part 4's knowledge on the field |
+
+The final load comes from concurrent connections, because one connection — however deep its pipeline — neither saturates a real server nor models real clients (the world is many-connectioned). Connection count and pipeline depth are CLI knobs: they are among the dials Part 7 will sweep.
+
+**Where concurrency and parallelism land in this design** (Part 4's vocabulary, applied):
+
+- **Concurrency** = the connection count: N tasks, chosen by us (say 32).
+- **Parallelism** = the workers carrying them: `available_parallelism()` on the client machine. Only that many tasks are *actually being processed* at any instant; the rest are suspended, awaiting network replies.
+- **And that is enough** — this workload is IO-bound (write, await, read: §4.5's world). Most of the 32 connections are waiting on the wire at any moment; two workers handle their wake-ups comfortably. Had the work been CPU-bound, worker count would be a wall; here it isn't.
+- The honest caveat (§4.5's lesson): wake-up bookkeeping *is* CPU. Push the client hard enough — hundreds of thousands of req/s with deep parsing — and its workers can saturate. The remedies are already policy: the client runs on an **unconstrained machine** (the topology rule: the measurer must never starve), and `worker_threads` can be raised. 
+- Latency accounting follows the **coordinated-omission** principle: in fixed-rate mode, each request's clock starts at its *scheduled* send time, not its actual one — a client pushed back by a struggling server must not hide that struggle from the report. (The heartbeat's `planned.elapsed()` was this exact principle.)
+
 *(5.4–5.6: pending — built and measured in the next steps.)*
 
 [↑ Go back to TOC](#table-of-contents)

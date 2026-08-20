@@ -1906,6 +1906,25 @@ tek tepe (sağlıklı):           iki tepe (iki rejim):
 
 Throttle'lı pod tam olarak iki tepeli türü üretir: isteklerin çoğu hızlı, ayrı bir nüfus `cpu.max` donmalarının arkasında takılı. p50 "her şey yolunda" der; histogram ikinci toplumu gösterir. §3.6'nın söz verdiği ve Bölüm 7'nin avlayacağı resim işte bu.
 
+### Design logic: client bütün bunları nasıl uyguluyor
+
+İnşa sırası — bilerek iki adım:
+
+| Adım | Bağlantı | Ne öğretir |
+|---|---|---|
+| ilk sürüm (§5.4) | **1 bağlantı**, tek task | protokol + async IO temeli, sadeleştirilmiş dünyada |
+| son sürüm (§5.5) | **N concurrent bağlantı** — her bağlantı bir `tokio::spawn` task'ı | gerçek yük; Bölüm 4 bilgisinin sahaya inişi |
+
+Nihai yük concurrent bağlantılardan basılır, çünkü tek bağlantı — pipeline'ı ne kadar derin olursa olsun — ne gerçek bir server'ı doyurur ne de gerçek client'ları modeller (dünya çok bağlantılıdır). Bağlantı sayısı ve pipeline derinliği CLI düğmeleridir: Bölüm 7'nin tarayacağı kadranlar arasındalar.
+
+**Bu tasarımda concurrency ve parallelism nereye düşüyor** (Bölüm 4'ün sözlüğü, uygulanmış):
+
+- **Concurrency** = bağlantı sayısı: N task, bizim seçimimiz (mesela 32).
+- **Parallelism** = onları taşıyan worker'lar: client makinesindeki `available_parallelism()`. Herhangi bir anda yalnız o kadar task *fiilen işlenir*; kalanı askıda, network cevabı bekler.
+- **Ve bu yeterlidir** — bu iş yükü IO-bound (yaz, await et, oku: §4.5'in dünyası). 32 bağlantının çoğu her an telde bekliyordur; iki worker uyanışlarını rahat karşılar. İş CPU-bound olsaydı worker sayısı duvar olurdu; burada değil.
+- Dürüst şerh (§4.5'in dersi): uyanma muhasebesi de *CPU'dur*. Client'ı yeterince sıkıştırırsan — yüzbinlerce req/s + derin parse — worker'ları doyabilir. Çareler zaten politika: client **kısıtsız makinede** koşar (topoloji kuralı: ölçen asla aç kalmamalı) ve `worker_threads` yükseltilebilir.
+- Latency muhasebesi **coordinated-omission** ilkesine uyar: sabit-oran modunda her isteğin saati *planlanan* gönderim anında başlar, gerçekleşende değil — zorlanmış server'ın geriye ittiği client, o zorlanmayı rapordan saklamamalıdır. (Heartbeat'in `planned.elapsed()`'i tam bu ilkeydi.)
+
 *(5.4–5.6: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
 
 [↑ Go back to TOC](#i̇çindekiler)
