@@ -37,15 +37,17 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 3.5 — thread × quota matrisi](#deney-35--thread--quota-matrisi)
   - [Deney 3.6 — stall'lar: matrisin göremediği acı](#deney-36--stalllar-matrisin-göremediği-acı)
   - [Deney 3.7 — "kaç CPU var?" sorusuna kim dürüst cevap verir](#deney-37--kaç-cpu-var-sorusuna-kim-dürüst-cevap-verir)
-- [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu-devam-ediyor)
+- [Bölüm 4 — Async Rust: tokio ve vCPU](#bölüm-4--async-rust-tokio-ve-vcpu)
   - [4.1 Cargo'nun dönüşü — proje kurulumu](#41-cargonun-dönüşü--proje-kurulumu)
   - [4.2 tokio nasıl zamanlar — cooperative, `.await`, task queue'lar](#42-tokio-nasıl-zamanlar--cooperative-await-task-queuelar)
   - [Deney 4.3 — tokio kaç worker açar?](#deney-43--tokio-kaç-worker-açar)
   - [Deney 4.4 — event loop'u bloke etmek, ölçülmüş](#deney-44--event-loopu-bloke-etmek-ölçülmüş)
   - [Deney 4.5 — iki thread üstünde bir milyon bekleyen task](#deney-45--iki-thread-üstünde-bir-milyon-bekleyen-task)
   - [Deney 4.6 — quota altında async](#deney-46--quota-altında-async)
-- [Bölüm 5 — Kubernetes requests & limits](#bölüm-5--kubernetes-requests--limits-yakında)
-- [Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında)
+- [Bölüm 5 — An experimental RESP load generator with tokio](#bölüm-5--an-experimental-resp-load-generator-with-tokio-devam-ediyor)
+  - [5.1 RESP protokolü — telin üstünde SET/GET](#51-resp-protokolü--telin-üstünde-setget)
+- [Bölüm 6 — Kubernetes requests & limits](#bölüm-6--kubernetes-requests--limits-yakında)
+- [Bölüm 7 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-7--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
 ## Müfredat
 
@@ -54,9 +56,10 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 | 1 | [Temel kavramlar](#bölüm-1--temel-kavramlar) | Core, hyperthread, vCPU nedir — kim kimi zamanlar? | ✅ |
 | 2 | [cgroup v2 elle](#bölüm-2--cgroup-v2-elle) | Kernel CPU zamanını nasıl dilimler, bunu nasıl canlı izlerim? | ✅ |
 | 3 | [Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci) | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | ✅ |
-| 4 | [Async Rust (tokio)](#bölüm-4--async-rust-tokio-ve-vcpu-devam-ediyor) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | ⏳ |
-| 5 | [Kubernetes requests/limits](#bölüm-5--kubernetes-requests--limits-yakında) | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
-| 6 | [Performans lab'ı (Redis & Dragonfly)](#bölüm-6--performans-labı-redis--dragonfly-boyutlandırma-yakında) | Zıt mimarili iki engine için *doğru* CPU kısıtları ne — VM'de ve OpenShift'te, ölçümle kanıtlı? | 🔜 |
+| 4 | [Async Rust (tokio)](#bölüm-4--async-rust-tokio-ve-vcpu) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | ✅ |
+| 5 | [RESP yük üreteci](#bölüm-5--an-experimental-resp-load-generator-with-tokio-devam-ediyor) | Bölüm 4'ün dersleri gerçek bir alete dönüşebilir mi — sabit oranlı, latency ölçen bir Redis-protokolü client'ı? | ⏳ |
+| 6 | [Kubernetes requests/limits](#bölüm-6--kubernetes-requests--limits-yakında) | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
+| 7 | [Performans lab'ı (Redis & Dragonfly)](#bölüm-7--performans-labı-redis--dragonfly-boyutlandırma-yakında) | Zıt mimarili iki engine için *doğru* CPU kısıtları ne — VM'de ve OpenShift'te, ölçümle kanıtlı? | 🔜 |
 
 ---
 
@@ -1099,9 +1102,9 @@ available_parallelism: 1
 
 [↑ Go back to TOC](#i̇çindekiler)
 
-# Bölüm 4 — Async Rust: tokio ve vCPU *(devam ediyor)*
+# Bölüm 4 — Async Rust: tokio ve vCPU
 
-Async bölümü, gerçek bir teslimatla: Bölüm 3'ün burner'ları *sync* dünyayı ölçtü; burada async karşılıklarını inşa ediyoruz — **tokio tabanlı bir RESP yük üreteci** (Redis protokolü konuşan bir client: sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla). Async'in ekmeğini gerçekten kazandığı yer network IO'dur; araç ile ders burada çakışır. Yol boyunca: tokio'nun runtime modeli (çok sayıda hafif task taşıyan az sayıda OS worker thread'i), limitli bir cgroup içinde kaç worker açtığı — varsayımla değil ölçümle — ve aynı quota'lar altında CPU-bound vs IO-bound task'lar. Cargo burada geri döner (tokio dış bir crate).
+Async bölümü: tokio runtime'ının vCPU'lar üstünde ve cgroup limitleri altında davranışı. Bölüm 3'ün burner'ları *sync* dünyayı ölçtü; burada aynı sorular task dünyasında yeniden soruluyor — runtime limitli cgroup içinde kaç worker açar (varsayımla değil ölçümle), CPU-bound iş bir event loop'a ne yapar, bekleyen-task concurrency'si nereye kadar ölçeklenir ve quota donması bunların hepsine ne eder. Cargo burada geri döner (tokio dış bir crate). Bölümün dersleri, Bölüm 5'te gerçek bir alete dövülür: bir RESP yük üreteci.
 
 ## 4.1 Cargo'nun dönüşü — proje kurulumu
 
@@ -1615,7 +1618,7 @@ $ ps -T -p <PID>          # her ölçekte birebir aynı:
 
 1. **Async ekonomisi, kanıtlandı.** 100.000 eşzamanlı bekleyen iş, 2 worker thread'de, en kötü uyanma 32 ms. OS thread olarak bu ~100.000 stack demekti (yüzlerce GB adres alanı, kernel run queue kaosu); burada dış şahit hiçbir ölçekte 3 thread'den fazlasını saymadı. Network server'ların async yazılmasının sebebi: **beklemek neredeyse bedava.**
 2. **Neredeyse bedava — sonsuz bedava değil.** Her task saniyede 10 kez uyanıyor; 1 M task = saniyede **10 milyon uyanma** talebi — ve her uyanma worker'lara birkaç µs'lik muhasebe (timer, queue, poll) ödetir. O fatura 2 vCPU'yu aştı: koşu 5 s → 42 s'ye uzadı, en kötü gecikme 1 saniyeyi buldu. *Bekleyen* concurrency'nin tavanı thread'lerinkinden ~1000× yüksek, ama para birimi aynı: **CPU zamanı.** Bu lab'ın her katmanı aynı kaynakta bitiyor.
-3. **Boyutlandırma çıkarımı:** "bu pod kaç bağlantı taşır?" önce bir memory sorusu değil, bir **uyanma-hızı** sorusudur: olay/saniye × olay başına maliyet vs pod'un CPU limiti. Bu formül doğruca Part 6'ya taşınacak.
+3. **Boyutlandırma çıkarımı:** "bu pod kaç bağlantı taşır?" önce bir memory sorusu değil, bir **uyanma-hızı** sorusudur: olay/saniye × olay başına maliyet vs pod'un CPU limiti. Bu formül doğruca Part 7'ye taşınacak.
 
 ### Problem → yaklaşım → seçenekler (4.5)
 
@@ -1719,17 +1722,65 @@ $ ./target/release/05_ioload 100000
 
 [↑ Go back to TOC](#i̇çindekiler)
 
-# Bölüm 5 — Kubernetes requests & limits *(yakında)*
+# Bölüm 5 — An experimental RESP load generator with tokio *(devam ediyor)*
+
+Bölüm 4 async dünyanın kurallarını öğretti; bu bölüm onları çalışan bir alete çeviriyor: Redis protokolü konuşan bir client — sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla. `redis` crate'i yok, kestirme yok: ham TCP ve elle kurulmuş protokol frame'leri — bu lab'ın "sihir yok" geleneğinde. Burada inşa edilen araç, Bölüm 7'nin boyutlandırma kampanyasının Tip-A silahıdır.
+
+Yol haritası: **5.1** telin üstünde RESP protokolü · **5.2** VM'e Redis kurulumu, elle RESP konuşmak · **5.3** client iskeleti: bağlantılar, pipelining, sabit oran · **5.4** p50/p99 ölçümü (§3.6'nın histogram borcu burada ödenir) · **5.5** localhost Redis'e karşı smoke test.
+
+## 5.1 RESP protokolü — telin üstünde SET/GET
+
+RESP (*REdis Serialization Protocol*), Redis'in, Dragonfly'ın ve Redis-uyumlu her store'un ortak tel dilidir. Yirmi yıl hayatta kalmasının tek sebebi var: utandırıcı denecek kadar basit — ilk byte'ıyla kendini ilan eden beş frame tipli bir metin protokolü:
+
+| İlk byte | Tip | Örnek |
+|---|---|---|
+| `+` | simple string | `+OK\r\n` |
+| `-` | error | `-ERR unknown command\r\n` |
+| `:` | integer | `:42\r\n` |
+| `$` | bulk string (uzunluk ön ekli) | `$3\r\nbar\r\n` |
+| `*` | array (eleman sayısı ön ekli) | `*3\r\n...` |
+
+Her satır `\r\n` (CRLF) ile biter. Bir **komut = bulk string'lerden oluşan bir array**. `SET foo bar` telin üstünde:
+
+```
+*3\r\n        ← 3 elemanlı array geliyor
+$3\r\n SET    ← bulk string, 3 byte: "SET"
+$3\r\n foo    ← bulk string, 3 byte: "foo"
+$3\r\n bar    ← bulk string, 3 byte: "bar"
+```
+
+Ham byte'lar olarak (hex dökümü):
+
+```
+2a 33 0d 0a 24 33 0d 0a 53 45 54 0d 0a 24 33 0d    |*3..$3..SET..$3.|
+0a 66 6f 6f 0d 0a 24 33 0d 0a 62 61 72 0d 0a       |.foo..$3..bar..|
+```
+
+(`2a`=`*`, `0d 0a`=`\r\n`, `53 45 54`=`SET` — her byte'ın hesabı belli.) Parse edeceğimiz cevaplar:
+
+```
+SET foo bar   →   +OK\r\n                 (simple string)
+GET foo       →   $3\r\nbar\r\n           (bulk string: uzunluk, sonra içerik)
+GET missing   →   $-1\r\n                 (null bulk string: anahtar yok)
+```
+
+**Yük üreteci için önemi — pipelining bedavadır.** RESP'te mesajların kendisinden başka framing yoktur, request ID'si de yoktur: server kesinlikle sıra ile cevaplar. Dolayısıyla N komutu beklemeden göndermek = **N frame'i tek write'ta yan yana yapıştırmak**; N cevap aynı sırayla döner. Pipeline derinliği, bir RESP client'ının en büyük throughput kolu — round-trip maliyetini N'e böler — ve implementasyonu string birleştirmedir. Protokolü crate çekmeden ham konuşabilmemizin sebebi tam bu basitlik.
+
+*(5.2–5.5: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
+
+[↑ Go back to TOC](#i̇çindekiler)
+
+# Bölüm 6 — Kubernetes requests & limits *(yakında)*
 
 Mekanizma, uçtan uca: Bölüm 3'ün burner'ları OpenShift'te pod olarak (statik musl binary, `FROM scratch` imaj), deney matrisi bu kez YAML ile. kubelet'in kurduğu cgroup ağacında gezinti (`kubepods.slice/...`), `requests`/`limits`'in Bölüm 2'deki dosyalara birebir eşlenmesi, elle ölçtüğümüz hücrenin (`echo "50000 100000" > cpu.max` → 241 M iter/s) Kubernetes'in `limits: cpu: 500m`'den kurduğu hücreyle aynı olduğunun teyidi ve her request/limit kombinasyonunun her iş yükü tipi için *faydalı / zararlı / etkisiz* olarak yargılanması.
 
 [↑ Go back to TOC](#i̇çindekiler)
 
-# Bölüm 6 — Performans lab'ı: Redis & Dragonfly boyutlandırma *(yakında)*
+# Bölüm 7 — Performans lab'ı: Redis & Dragonfly boyutlandırma *(yakında)*
 
 Hasat bölümü: gerçek engine'ler, gerçek yük, ölçülmüş boyutlandırma reçeteleri — VM'de elle kurulan cgroup'larla, OpenShift'te requests/limits ile. Zıt mimarili iki engine — Redis (tek thread'li event loop ≈ bizim 1-thread satırı) ve Dragonfly (thread-per-core ≈ bizim 8-thread satırı) — aynı yük altında, CPU kısıtları taranarak. Birbirini çapraz doğrulayan iki alet:
 
-- **Tip A:** Bölüm 4'te yazdığımız tokio RESP client'ı — *uygulamanın gerçek write path'ini* modeller, yük deseni tamamen kontrolümüzde.
+- **Tip A:** Bölüm 5'te yazdığımız tokio RESP client'ı — *uygulamanın gerçek write path'ini* modeller, yük deseni tamamen kontrolümüzde.
 - **Tip B:** `memtier_benchmark` (Redis Ltd.'nin standart benchmark imajı) — dünyanın güvendiği endüstri referansı.
 
 ### Test topolojisi: ölçen asla aç kalmamalı

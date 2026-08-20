@@ -37,15 +37,17 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 3.5 — the thread × quota matrix](#experiment-35--the-thread--quota-matrix)
   - [Experiment 3.6 — stalls: the pain the matrix cannot see](#experiment-36--stalls-the-pain-the-matrix-cannot-see)
   - [Experiment 3.7 — who answers "how many CPUs?" honestly](#experiment-37--who-answers-how-many-cpus-honestly)
-- [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu-in-progress)
+- [Part 4 — Async Rust: tokio and the vCPU](#part-4--async-rust-tokio-and-the-vcpu)
   - [4.1 Cargo returns — project setup](#41-cargo-returns--project-setup)
   - [4.2 How tokio schedules — cooperative, `.await`, task queues](#42-how-tokio-schedules--cooperative-await-task-queues)
   - [Experiment 4.3 — how many workers does tokio start?](#experiment-43--how-many-workers-does-tokio-start)
   - [Experiment 4.4 — blocking the event loop, measured](#experiment-44--blocking-the-event-loop-measured)
   - [Experiment 4.5 — a million waiting tasks on two threads](#experiment-45--a-million-waiting-tasks-on-two-threads)
   - [Experiment 4.6 — async under quota](#experiment-46--async-under-quota)
-- [Part 5 — Kubernetes requests & limits](#part-5--kubernetes-requests--limits-coming-soon)
-- [Part 6 — Performance lab: sizing Redis & Dragonfly](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon)
+- [Part 5 — An experimental RESP load generator with tokio](#part-5--an-experimental-resp-load-generator-with-tokio-in-progress)
+  - [5.1 The RESP protocol — SET/GET on the wire](#51-the-resp-protocol--setget-on-the-wire)
+- [Part 6 — Kubernetes requests & limits](#part-6--kubernetes-requests--limits-coming-soon)
+- [Part 7 — Performance lab: sizing Redis & Dragonfly](#part-7--performance-lab-sizing-redis--dragonfly-coming-soon)
 
 ## Curriculum
 
@@ -54,9 +56,10 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 | 1 | [CPU fundamentals](#part-1--cpu-fundamentals) | What is a core, a hyperthread, a vCPU — and who schedules whom? | ✅ |
 | 2 | [cgroup v2 by hand](#part-2--cgroup-v2-by-hand) | How does the kernel slice CPU time, and how do I watch it happen? | ✅ |
 | 3 | [Rust load generator](#part-3--rust-load-generator) | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | ✅ |
-| 4 | [Async Rust (tokio)](#part-4--async-rust-tokio-and-the-vcpu-in-progress) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | ⏳ |
-| 5 | [Kubernetes requests/limits](#part-5--kubernetes-requests--limits-coming-soon) | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
-| 6 | [Performance lab (Redis & Dragonfly)](#part-6--performance-lab-sizing-redis--dragonfly-coming-soon) | What are the *right* CPU constraints for two opposite engine architectures — proven by measurement, on VM and OpenShift? | 🔜 |
+| 4 | [Async Rust (tokio)](#part-4--async-rust-tokio-and-the-vcpu) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | ✅ |
+| 5 | [RESP load generator](#part-5--an-experimental-resp-load-generator-with-tokio-in-progress) | Can Part 4's lessons build a real instrument — a fixed-rate, latency-measuring Redis-protocol client? | ⏳ |
+| 6 | [Kubernetes requests/limits](#part-6--kubernetes-requests--limits-coming-soon) | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
+| 7 | [Performance lab (Redis & Dragonfly)](#part-7--performance-lab-sizing-redis--dragonfly-coming-soon) | What are the *right* CPU constraints for two opposite engine architectures — proven by measurement, on VM and OpenShift? | 🔜 |
 
 ---
 
@@ -1099,9 +1102,9 @@ available_parallelism: 1
 
 [↑ Go back to TOC](#table-of-contents)
 
-# Part 4 — Async Rust: tokio and the vCPU *(in progress)*
+# Part 4 — Async Rust: tokio and the vCPU
 
-The async chapter, with a real deliverable: the Part 3 burners measured the *sync* world; here we build their async counterpart — a **tokio-based RESP load generator** (a client that speaks the Redis protocol: pipelined SET/GET at a fixed rate, reporting p50/p99 latency). Network IO is where async actually earns its keep, so the tool and the lesson coincide. Along the way: tokio's runtime model (a few OS worker threads carrying many lightweight tasks), how many workers it starts inside a limited cgroup — measured, not assumed — and CPU-bound vs IO-bound tasks under the same quotas. Cargo returns here (tokio is an external crate).
+The async chapter: how tokio's runtime behaves on vCPUs and under cgroup limits. The Part 3 burners measured the *sync* world; here their questions are re-asked in the world of tasks — how many workers the runtime starts inside a limited cgroup (measured, not assumed), what CPU-bound work does to an event loop, how far waiting-task concurrency scales, and what a quota freeze does to all of it. Cargo returns here (tokio is an external crate). The chapter's lessons are then forged into a real instrument in Part 5: a RESP load generator.
 
 ## 4.1 Cargo returns — project setup
 
@@ -1615,7 +1618,7 @@ $ ps -T -p <PID>          # identical at every scale:
 
 1. **The async economy, proven.** 100 000 concurrently waiting jobs on 2 worker threads, worst wake-up 32 ms. As OS threads this would be ~100 000 stacks (hundreds of GB of address space, kernel run-queue chaos); here the external witness never counted past 3 threads. This is why network servers are written async: waiting is nearly free.
 2. **Nearly free — not infinitely free.** Each task wakes 10×/s, so 1 M tasks demand **10 million wake-ups per second** — and every wake-up costs the workers a few µs of bookkeeping (timer pop, queue push, poll). That bill exceeded 2 vCPUs: the run stretched 5 s → 42 s and the worst delay hit a full second. The ceiling for *waiting* concurrency is ~1000× higher than for threads, but it is still priced in the same currency: **CPU time**. Every layer of this lab ends at the same resource.
-3. **Sizing corollary:** "how many connections can this pod hold?" is not a memory question first — it is a *wake-rate* question: events/second × cost-per-event vs the pod's CPU limit. That formula carries straight into Part 6.
+3. **Sizing corollary:** "how many connections can this pod hold?" is not a memory question first — it is a *wake-rate* question: events/second × cost-per-event vs the pod's CPU limit. That formula carries straight into Part 7.
 
 ### Problem → approach → options (4.5)
 
@@ -1719,17 +1722,65 @@ $ ./target/release/05_ioload 100000
 
 [↑ Go back to TOC](#table-of-contents)
 
-# Part 5 — Kubernetes requests & limits *(coming soon)*
+# Part 5 — An experimental RESP load generator with tokio *(in progress)*
+
+Part 4 taught the rules of the async world; this part turns them into a working instrument: a client that speaks the Redis protocol — pipelined SET/GET at a fixed rate, reporting p50/p99 latency. No `redis` crate, no shortcuts: raw TCP and hand-built protocol frames, in this lab's tradition of no magic. The tool built here is the Type-A weapon of Part 7's sizing campaign.
+
+Roadmap: **5.1** the RESP protocol on the wire · **5.2** installing Redis on the VM, speaking RESP by hand · **5.3** the client skeleton: connections, pipelining, fixed rate · **5.4** p50/p99 measurement (the histogram debt from §3.6 is paid here) · **5.5** smoke test against a localhost Redis.
+
+## 5.1 The RESP protocol — SET/GET on the wire
+
+RESP (*REdis Serialization Protocol*) is the wire language of Redis, Dragonfly, and every Redis-compatible store. It survived twenty years for one reason: it is almost embarrassingly simple — a text protocol with five frame types, each announced by its first byte:
+
+| First byte | Type | Example |
+|---|---|---|
+| `+` | simple string | `+OK\r\n` |
+| `-` | error | `-ERR unknown command\r\n` |
+| `:` | integer | `:42\r\n` |
+| `$` | bulk string (length-prefixed) | `$3\r\nbar\r\n` |
+| `*` | array (element-count-prefixed) | `*3\r\n...` |
+
+Every line ends with `\r\n` (CRLF). A **command is an array of bulk strings**. `SET foo bar` on the wire:
+
+```
+*3\r\n        ← array of 3 elements follows
+$3\r\n SET    ← bulk string, 3 bytes: "SET"
+$3\r\n foo    ← bulk string, 3 bytes: "foo"
+$3\r\n bar    ← bulk string, 3 bytes: "bar"
+```
+
+As raw bytes (hex dump):
+
+```
+2a 33 0d 0a 24 33 0d 0a 53 45 54 0d 0a 24 33 0d    |*3..$3..SET..$3.|
+0a 66 6f 6f 0d 0a 24 33 0d 0a 62 61 72 0d 0a       |.foo..$3..bar..|
+```
+
+(`2a`=`*`, `0d 0a`=`\r\n`, `53 45 54`=`SET` — every byte accounted for.) The replies we will parse:
+
+```
+SET foo bar   →   +OK\r\n                 (simple string)
+GET foo       →   $3\r\nbar\r\n           (bulk string: length, then payload)
+GET missing   →   $-1\r\n                 (null bulk string: key not found)
+```
+
+**Why this matters for a load generator — pipelining is free.** RESP has no framing beyond the messages themselves and no request IDs: the server answers strictly in order. So sending N commands without waiting is just **concatenating N frames into one write**; the N replies come back in the same order. Pipeline depth is the single biggest throughput lever a RESP client has — it divides the round-trip cost by N — and implementing it is string concatenation. That simplicity is exactly why we can afford to speak the protocol raw instead of pulling a crate.
+
+*(5.2–5.5: pending — built and measured in the next steps.)*
+
+[↑ Go back to TOC](#table-of-contents)
+
+# Part 6 — Kubernetes requests & limits *(coming soon)*
 
 The mechanism, end to end: the Part 3 burners deployed as pods on OpenShift (a static musl binary in a `FROM scratch` image), with the experiment matrix replayed in YAML. Walking the cgroup tree that kubelet builds (`kubepods.slice/...`), mapping `requests`/`limits` to the exact files from Part 2, confirming that the cell we measured by hand (`echo "50000 100000" > cpu.max` → 241 M iter/s) is the same cell Kubernetes builds from `limits: cpu: 500m`, and judging each request/limit combination as *helpful, harmful, or neutral* for each workload type.
 
 [↑ Go back to TOC](#table-of-contents)
 
-# Part 6 — Performance lab: sizing Redis & Dragonfly *(coming soon)*
+# Part 7 — Performance lab: sizing Redis & Dragonfly *(coming soon)*
 
 The payoff chapter: real engines, real load, measured sizing recipes — on the VM with hand-set cgroups, and on OpenShift with requests/limits. Two engines with opposite architectures — Redis (single-threaded event loop ≈ our 1-thread row) and Dragonfly (thread-per-core ≈ our 8-thread row) — put under the same load while their CPU constraints are swept. Two instruments, cross-checking each other:
 
-- **Type A:** our own tokio RESP client from Part 4 — models the *application's actual write path*, workload shape fully under our control.
+- **Type A:** our own tokio RESP client from Part 5 — models the *application's actual write path*, workload shape fully under our control.
 - **Type B:** `memtier_benchmark` (Redis Ltd.'s standard benchmark image) — the industry reference the world trusts.
 
 ### Test topology: the measurer must never starve
