@@ -1,0 +1,48 @@
+Redis'in en çok kullanılan komutları, kategori kategori — hepsi RESP'te aynı kalıptır
+(bulk string array), yani MSET k1 v1 k2 v2 = *5\r\n$4\r\nMSET\r\n... — kural değişmez:
+
+String'ler (yük üretecinin çekirdeği):
+
+| Komut                        | İş                              | Cevap tipi                  |
+|------------------------------|---------------------------------|-----------------------------|
+| SET k v                      | yaz                             | +OK                         |
+| GET k                        | oku                             | $.. bulk (yoksa $-1)        |
+| MSET k1 v1 k2 v2 ...         | çoklu yaz (tek komutta N key)   | +OK                         |
+| MGET k1 k2 ...               | çoklu oku                       | *N array of bulk            |
+| INCR k / INCRBY k n          | atomik sayaç                    | :42 integer                 |
+| DEL k [k2 ...]               | sil                             | :N (silinen sayısı)         |
+| EXISTS k                     | var mı                          | :0/1                        |
+| EXPIRE k saniye / TTL k      | ömür ver / kalan ömür           | :1 / :kalan                 |
+
+Hash'ler (obje/kayıt saklama — "kullanıcı profili" deseni):
+
+| Komut                              | İş                                                    |
+|------------------------------------|-------------------------------------------------------|
+| HSET user:1 name levent age 40     | alan(lar) yaz                                         |
+| HGET user:1 name                   | tek alan oku                                          |
+| HGETALL user:1                     | tüm alanları oku (*N array: alan,değer,alan,değer...) |
+| HMGET user:1 name age              | seçili alanlar                                        |
+| HDEL user:1 age                    | alan sil                                              |
+
+List / Set / Sorted Set (kuyruk, üyelik, sıralama desenleri):
+
+| Komut                              | İş                                          |
+|------------------------------------|---------------------------------------------|
+| LPUSH q item / RPOP q              | kuyruk (bir uçtan koy, öbüründen al)        |
+| LRANGE q 0 -1                      | listeyi oku                                 |
+| SADD tags a b / SISMEMBER tags a   | küme + üyelik testi                         |
+| ZADD board 100 alice / ZRANGE board 0 9 | skorlu sıralama (leaderboard deseni)   |
+
+Araç komutları (lab'da işe yarayacaklar):
+
+| Komut       | İş                                                        |
+|-------------|-----------------------------------------------------------|
+| PING        | canlılık (+PONG)                                          |
+| DBSIZE      | kaç key var                                               |
+| FLUSHALL    | her şeyi sil (testler arası temizlik)                     |
+| INFO stats  | server istatistikleri (ops/sec dahil — Part 7'de şahit!)  |
+
+Üreteç için anlamı: client'ın çekirdeği SET/GET olacak (5.3), ama komut kodlayıcı generic
+olduğu için (["MSET","k1","v1",...] → frame) workload çeşitleri bedavaya gelir — Part 7'de
+"SET/GET karışımı" yanında "MSET batch yükü" ya da "HSET profil yükü" gibi desenler de
+taratılabilir. memtier de benzer desenleri destekler, çapraz doğrulama bozulmaz.

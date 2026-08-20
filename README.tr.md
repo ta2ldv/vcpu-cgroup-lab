@@ -46,6 +46,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 4.6 — quota altında async](#deney-46--quota-altında-async)
 - [Bölüm 5 — An experimental RESP load generator with tokio](#bölüm-5--an-experimental-resp-load-generator-with-tokio-devam-ediyor)
   - [5.1 RESP protokolü — telin üstünde SET/GET](#51-resp-protokolü--telin-üstünde-setget)
+  - [5.2 Redis kurulumu, elle RESP konuşmak](#52-redis-kurulumu-elle-resp-konuşmak)
 - [Bölüm 6 — Kubernetes requests & limits](#bölüm-6--kubernetes-requests--limits-yakında)
 - [Bölüm 7 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-7--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -1766,7 +1767,92 @@ GET missing   →   $-1\r\n                 (null bulk string: anahtar yok)
 
 **Yük üreteci için önemi — pipelining bedavadır.** RESP'te mesajların kendisinden başka framing yoktur, request ID'si de yoktur: server kesinlikle sıra ile cevaplar. Dolayısıyla N komutu beklemeden göndermek = **N frame'i tek write'ta yan yana yapıştırmak**; N cevap aynı sırayla döner. Pipeline derinliği, bir RESP client'ının en büyük throughput kolu — round-trip maliyetini N'e böler — ve implementasyonu string birleştirmedir. Protokolü crate çekmeden ham konuşabilmemizin sebebi tam bu basitlik.
 
-*(5.2–5.5: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
+## 5.2 Redis kurulumu, elle RESP konuşmak
+
+Server'ı ve CLI'ını VM'e kur (Ubuntu paketi; servis otomatik başlar, `localhost:6379`'u dinler):
+
+```bash
+sudo NEEDRESTART_MODE=a apt install -y redis-server redis-tools
+```
+
+Resmî client üzerinden ilk temas — ve hemen yanında, aynı konuşmanın ham hali, bölümün açacağı şeyin önizlemesi olarak:
+
+```
+$ redis-cli ping
+PONG
+$ redis-cli SET foo bar
+OK
+$ redis-cli GET foo
+"bar"
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' | timeout 1 nc localhost 6379 | xxd
+00000000: 2b4f 4b0d 0a24 330d 0a62 6172 0d0a       +OK..$3..bar..
+```
+
+Aynı server, aynı komutlar — üstte nazik client'la, altta çıplak byte'larla. Bölümün geri kalanı alttaki satırı parça parça söküyor.
+
+`redis-cli` naziktir — RESP frame'lerini senin yerine kurar, cevapları süsleyip basar. Ama bu lab sihir yapmaz; ham byte konuşacağız. Üç küçük araç, her birinin tek işi var:
+
+- **`printf`** — argümanını *escape dizilerini yorumlayarak* basar: string'deki her `\r\n`, gerçek CR+LF byte çiftine dönüşür (`echo` bunu güvenilir yapmazdı — `printf` seçmemizin sebebi). Hiçbir şey göndermez; sadece stdout'a *byte üretir*.
+- **`xxd`** — hex dump aracı: geçen byte'ları aynen gösterir, solda hex, sağda basılabilir karakterler. Byte mikroskobumuz.
+- **`nc` (netcat)** — çıplak bir TCP bağlantısı açar, stdin'i oraya gönderir, dönen ne varsa basar. Kendi görgüsü olmayan bir telefon hattı.
+
+Önce göndereceğimiz şeye *bak* — yalın `printf`, sonra mikroskop altında:
+
+```
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n'
+*3
+$3
+SET
+$3
+foo
+$3
+bar
+*2
+$3
+GET
+$3
+foo
+
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' | xxd
+00000000: 2a33 0d0a 2433 0d0a 5345 540d 0a24 330d  *3..$3..SET..$3.
+00000010: 0a66 6f6f 0d0a 2433 0d0a 6261 720d 0a2a  .foo..$3..bar..*
+00000020: 320d 0a24 330d 0a47 4554 0d0a 2433 0d0a  2..$3..GET..$3..
+00000030: 666f 6f0d 0a                             foo..
+```
+
+İlk biçim, frame'lerin aslında satır tabanlı metin olduğunu gösterir (her `\r\n` satır sonu olarak görünür); ikincisi aynı 53 byte'ı server'ın alacağı haliyle gösterir — §5.1'in hex dökümü, bu kez kendi elinle üretilmiş. Şimdi *gönder* — aynı `printf`, ham TCP bağlantısına borulanır, cevap `xxd` ile dökülür:
+
+```
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' \
+    | timeout 1 nc localhost 6379 | xxd
+00000000: 2b4f 4b0d 0a24 330d 0a62 6172 0d0a       +OK..$3..bar..
+```
+
+O boru hattının anatomisi, aşama aşama:
+
+```
+printf '...'  │  timeout 1  nc localhost 6379  │  xxd
+────────────  │  ─────────  ─────────────────  │  ────
+53 byte'lık   │  1 sn sonra 6379 portuna TCP   │  dönen ne varsa
+isteği        │  nc'yi      bağlantısı açar,   │  hex olarak
+stdout'a      │  öldürür    stdin'ini tele     │  döker — cevap
+üretir        │  (sebebi    gönderir, server   │  byte'ları
+              │  aşağıda)   ne yollarsa basar  │
+```
+
+`nc` gerçekte nedir: mümkün olan en basit TCP client'ı. Protokol bilgisi yok, formatlama yok, retry yok — bağlanır, iki yönde byte taşır, hepsi bu. Tam da bu cahilliği onu buradaki doğru araç yapar: bizimle tel arasında hiçbir şey yok; `xxd`'nin gösterdiği şey protokolün *kendisidir*. `timeout 1` sarmalayıcısına gelince: `nc` bir "konuşmanın" ne zaman bittiğini bilemez — server'ın cevabından sonra bağlantıyı sonsuza dek açık tutup daha fazlasını beklerdi. Localhost için bir saniye fazlasıyla yeter; sonra `timeout` onu öldürür, boru hattı tamamlanır.
+
+Cevap byte'larını §5.1'in tablosuyla karşılaştır — her birinin hesabı belli:
+
+```
+2b 4f 4b 0d 0a          +OK\r\n         ← SET'in cevabı (simple string)
+24 33 0d 0a             $3\r\n          ← GET'in cevabı: bulk string, 3 byte geliyor
+62 61 72 0d 0a          bar\r\n         ←   ...o 3 byte: "bar"
+```
+
+O tek satırda iki şey oldu ve ikincisi çok önemli: **iki komutu, aralarında beklemeden, tek write'ta gönderdik — ve iki cevabı, sırasıyla, tek read'de aldık.** İşte pipelining *budur*; bayrak yok, açılacak özellik yok — §5.1'in söz verdiği gibi protokolün tasarımından kendiliğinden düştü. Birazdan yazacağımız client aynı şeyi yapacak; sadece N komut derinliğinde ve yanında kronometreyle.
+
+*(5.3–5.5: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
 
 [↑ Go back to TOC](#i̇çindekiler)
 

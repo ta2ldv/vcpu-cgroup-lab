@@ -46,6 +46,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 4.6 — async under quota](#experiment-46--async-under-quota)
 - [Part 5 — An experimental RESP load generator with tokio](#part-5--an-experimental-resp-load-generator-with-tokio-in-progress)
   - [5.1 The RESP protocol — SET/GET on the wire](#51-the-resp-protocol--setget-on-the-wire)
+  - [5.2 Installing Redis, speaking RESP by hand](#52-installing-redis-speaking-resp-by-hand)
 - [Part 6 — Kubernetes requests & limits](#part-6--kubernetes-requests--limits-coming-soon)
 - [Part 7 — Performance lab: sizing Redis & Dragonfly](#part-7--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -1766,7 +1767,94 @@ GET missing   →   $-1\r\n                 (null bulk string: key not found)
 
 **Why this matters for a load generator — pipelining is free.** RESP has no framing beyond the messages themselves and no request IDs: the server answers strictly in order. So sending N commands without waiting is just **concatenating N frames into one write**; the N replies come back in the same order. Pipeline depth is the single biggest throughput lever a RESP client has — it divides the round-trip cost by N — and implementing it is string concatenation. That simplicity is exactly why we can afford to speak the protocol raw instead of pulling a crate.
 
-*(5.2–5.5: pending — built and measured in the next steps.)*
+## 5.2 Installing Redis, speaking RESP by hand
+
+Install the server and its CLI on the VM (Ubuntu package; the service starts automatically, listening on `localhost:6379`):
+
+```bash
+sudo NEEDRESTART_MODE=a apt install -y redis-server redis-tools
+```
+
+First contact through the official client — and right next to it, the same conversation raw, as a preview of what this section unpacks:
+
+```
+$ redis-cli ping
+PONG
+$ redis-cli SET foo bar
+OK
+$ redis-cli GET foo
+"bar"
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' | timeout 1 nc localhost 6379 | xxd
+00000000: 2b4f 4b0d 0a24 330d 0a62 6172 0d0a       +OK..$3..bar..
+```
+
+Same server, same commands — top with the friendly client, bottom with bare bytes. The rest of the section dissects the bottom line piece by piece.
+
+`redis-cli` is friendly — it builds the RESP frames for you and pretty-prints the replies. But this lab doesn't do magic, so we'll speak raw bytes. Three small tools do it, each with one job:
+
+- **`printf`** — prints its argument *interpreting escape sequences*: every `\r\n` in the string becomes a real CR+LF byte pair (which `echo` wouldn't reliably do — the reason we use `printf`). It doesn't send anything; it just *produces bytes* on stdout.
+- **`xxd`** — a hex dump tool: shows exactly which bytes passed through, hex on the left, printable characters on the right. Our byte microscope.
+- **`nc` (netcat)** — opens a bare TCP connection, sends stdin to it, prints what comes back. A telephone line with no manners of its own.
+
+First, *look at* what we are about to send — `printf` alone, then through the microscope:
+
+```
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n'
+*3
+$3
+SET
+$3
+foo
+$3
+bar
+*2
+$3
+GET
+$3
+foo
+
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' | xxd
+00000000: 2a33 0d0a 2433 0d0a 5345 540d 0a24 330d  *3..$3..SET..$3.
+00000010: 0a66 6f6f 0d0a 2433 0d0a 6261 720d 0a2a  .foo..$3..bar..*
+00000020: 320d 0a24 330d 0a47 4554 0d0a 2433 0d0a  2..$3..GET..$3..
+00000030: 666f 6f0d 0a                             foo..
+```
+
+The first form shows the frames as the line-based text they are (each `\r\n` renders as a line break); the second shows the same 53 bytes the way the server will receive them — §5.1's hex dump, now produced by your own hands. Now *send* them — the same `printf` piped into a raw TCP connection, the reply dumped with `xxd`:
+
+```
+$ printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' \
+    | timeout 1 nc localhost 6379 | xxd
+00000000: 2b4f 4b0d 0a24 330d 0a62 6172 0d0a       +OK..$3..bar..
+```
+
+Anatomy of that pipeline, stage by stage:
+
+```
+printf '...'  │  timeout 1  nc localhost 6379  │  xxd
+────────────  │  ─────────  ─────────────────  │  ────
+produces the  │  kills nc   opens a TCP        │  dumps whatever
+53 request    │  after 1 s  connection to      │  came back as
+bytes on      │  (see why   port 6379, sends   │  hex — the
+stdout        │  below)     its stdin down     │  reply bytes
+              │             the wire, prints   │
+              │             whatever the       │
+              │             server sends back  │
+```
+
+What `nc` actually is: the simplest possible TCP client. No protocol knowledge, no formatting, no retries — it connects, ships bytes in both directions, and that's all. That ignorance is exactly why it's the right tool here: nothing between us and the wire, so what `xxd` shows *is* the protocol. And the `timeout 1` wrapper: `nc` has no idea when a "conversation" is over — after the server's reply it would happily hold the connection open forever waiting for more. One second is plenty for localhost; then `timeout` kills it and the pipeline finishes.
+
+Read the reply bytes against §5.1's table — every one accounted for:
+
+```
+2b 4f 4b 0d 0a          +OK\r\n         ← SET's reply (simple string)
+24 33 0d 0a             $3\r\n          ← GET's reply: bulk string, 3 bytes follow
+62 61 72 0d 0a          bar\r\n         ←   ...the 3 bytes: "bar"
+```
+
+Two things happened in that one line, and the second one matters enormously: **we sent two commands in a single write without waiting between them — and got both replies back, in order, in a single read.** That *is* pipelining; no flag, no feature to enable — it fell out of the protocol's design, exactly as §5.1 promised. The client we build next does the same thing, just N commands deep and with a stopwatch attached.
+
+*(5.3–5.5: pending — built and measured in the next steps.)*
 
 [↑ Go back to TOC](#table-of-contents)
 
