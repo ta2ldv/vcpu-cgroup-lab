@@ -44,10 +44,14 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
   - [Experiment 4.4 — blocking the event loop, measured](#experiment-44--blocking-the-event-loop-measured)
   - [Experiment 4.5 — a million waiting tasks on two threads](#experiment-45--a-million-waiting-tasks-on-two-threads)
   - [Experiment 4.6 — async under quota](#experiment-46--async-under-quota)
-- [Part 5 — An experimental RESP load generator with tokio](#part-5--an-experimental-resp-load-generator-with-tokio-in-progress)
+- [Part 5 — An experimental RESP load generator with tokio: RespPress](#part-5--an-experimental-resp-load-generator-with-tokio-resppress-in-progress)
   - [5.1 The RESP protocol — SET/GET on the wire](#51-the-resp-protocol--setget-on-the-wire)
   - [5.2 Installing Redis, speaking RESP by hand](#52-installing-redis-speaking-resp-by-hand)
   - [5.3 The vocabulary of measurement — latency, percentiles, histograms](#53-the-vocabulary-of-measurement--latency-percentiles-histograms)
+  - [5.4 Our RespPress design — v1: Single-Thread PoC](#54-our-resppress-design--v1-single-thread-poc)
+  - [5.5 Using RespPress v1](#55-using-resppress-v1)
+  - [5.6 Our RespPress design — v2: Concurrent & Parallel](#56-our-resppress-design--v2-concurrent--parallel)
+  - [5.7 Using RespPress v2](#57-using-resppress-v2)
 - [Part 6 — Kubernetes requests & limits](#part-6--kubernetes-requests--limits-coming-soon)
 - [Part 7 — Performance lab: sizing Redis & Dragonfly](#part-7--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -59,7 +63,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 | 2 | [cgroup v2 by hand](#part-2--cgroup-v2-by-hand) | How does the kernel slice CPU time, and how do I watch it happen? | ✅ |
 | 3 | [Rust load generator](#part-3--rust-load-generator) | How do thread count, concurrency and parallelism interact with vCPUs — measured, not guessed? | ✅ |
 | 4 | [Async Rust (tokio)](#part-4--async-rust-tokio-and-the-vcpu) | What do async tasks add on top of threads — and how does the worker pool interact with vCPUs and cgroup limits? | ✅ |
-| 5 | [RESP load generator](#part-5--an-experimental-resp-load-generator-with-tokio-in-progress) | Can Part 4's lessons build a real instrument — a fixed-rate, latency-measuring Redis-protocol client? | ⏳ |
+| 5 | [RespPress (RESP load generator)](#part-5--an-experimental-resp-load-generator-with-tokio-resppress-in-progress) | Can Part 4's lessons build a real instrument — a fixed-rate, latency-measuring Redis-protocol client? | ⏳ |
 | 6 | [Kubernetes requests/limits](#part-6--kubernetes-requests--limits-coming-soon) | How do `requests`/`limits` translate to cgroup files, and how do all the sync/async workloads behave under them? | 🔜 |
 | 7 | [Performance lab (Redis & Dragonfly)](#part-7--performance-lab-sizing-redis--dragonfly-coming-soon) | What are the *right* CPU constraints for two opposite engine architectures — proven by measurement, on VM and OpenShift? | 🔜 |
 
@@ -1724,11 +1728,11 @@ $ ./target/release/05_ioload 100000
 
 [↑ Go back to TOC](#table-of-contents)
 
-# Part 5 — An experimental RESP load generator with tokio *(in progress)*
+# Part 5 — An experimental RESP load generator with tokio: RespPress *(in progress)*
 
-Part 4 taught the rules of the async world; this part turns them into a working instrument: a client that speaks the Redis protocol — pipelined SET/GET at a fixed rate, reporting p50/p99 latency. No `redis` crate, no shortcuts: raw TCP and hand-built protocol frames, in this lab's tradition of no magic. The tool built here is the Type-A weapon of Part 7's sizing campaign.
+Part 4 taught the rules of the async world; this part turns them into a working instrument — **RespPress**, a client that speaks the Redis protocol — pipelined SET/GET at a fixed rate, reporting p50/p99 latency. No `redis` crate, no shortcuts: raw TCP and hand-built protocol frames, in this lab's tradition of no magic. The tool built here is the Type-A weapon of Part 7's sizing campaign.
 
-Roadmap: **5.1** the RESP protocol on the wire · **5.2** installing Redis on the VM, speaking RESP by hand · **5.3** the vocabulary of measurement: latency, percentiles, histograms · **5.4** the client skeleton: connections, pipelining · **5.5** fixed rate and the full report (the histogram debt from §3.6 is paid here) · **5.6** smoke test against a localhost Redis.
+Roadmap: **5.1** the RESP protocol on the wire · **5.2** installing Redis on the VM, speaking RESP by hand · **5.3** the vocabulary of measurement: latency, percentiles, histograms · **5.4** our RespPress design — v1 (one connection) · **5.5** using RespPress v1 · **5.6** our RespPress design — v2 (concurrent connections, fixed rate, the full report — §3.6's histogram debt is paid here) · **5.7** using RespPress v2.
 
 ## 5.1 The RESP protocol — SET/GET on the wire
 
@@ -1915,7 +1919,7 @@ Build order — two steps, deliberately:
 | Step | Connections | What it teaches |
 |---|---|---|
 | first version (§5.4) | **1 connection**, one task | the protocol + async IO basics, in a simplified world |
-| final version (§5.5) | **N concurrent connections** — each connection one `tokio::spawn` task | real load; Part 4's knowledge on the field |
+| final version (§5.6) | **N concurrent connections** — each connection one `tokio::spawn` task | real load; Part 4's knowledge on the field |
 
 The final load comes from concurrent connections, because one connection — however deep its pipeline — neither saturates a real server nor models real clients (the world is many-connectioned). Connection count and pipeline depth are CLI knobs: they are among the dials Part 7 will sweep.
 
@@ -1927,7 +1931,21 @@ The final load comes from concurrent connections, because one connection — how
 - The honest caveat (§4.5's lesson): wake-up bookkeeping *is* CPU. Push the client hard enough — hundreds of thousands of req/s with deep parsing — and its workers can saturate. The remedies are already policy: the client runs on an **unconstrained machine** (the topology rule: the measurer must never starve), and `worker_threads` can be raised. 
 - Latency accounting follows the **coordinated-omission** principle: in fixed-rate mode, each request's clock starts at its *scheduled* send time, not its actual one — a client pushed back by a struggling server must not hide that struggle from the report. (The heartbeat's `planned.elapsed()` was this exact principle.)
 
-*(5.4–5.6: pending — built and measured in the next steps.)*
+## 5.4 Our RespPress design — v1: Single-Thread PoC
+
+*(placeholder — coming next)* The first working RespPress: one connection, one task. The frame encoder (§5.1's rules turned into a Rust function), an async TCP connection, SET/GET round-trips, replies read and verified. Code at [`tokioburn/src/bin/06_resppress_v1.rs`](tokioburn/src/bin/06_resppress_v1.rs), explained line by line here.
+
+## 5.5 Using RespPress v1
+
+*(placeholder — coming next)* The v1 smoke test against the localhost Redis: commands, real output, and what the numbers do (and deliberately do not yet) tell us.
+
+## 5.6 Our RespPress design — v2: Concurrent & Parallel
+
+*(placeholder — coming next)* The real instrument: N concurrent connections (one task each), pipeline depth, fixed request rate, and the full report — config echo, achieved rate, errors, data volume, min/p50/p90/p99/p99.5/p99.9/max/avg, histogram. Coordinated-omission-safe timing. Code at [`tokioburn/src/bin/07_resppress_v2.rs`](tokioburn/src/bin/07_resppress_v2.rs).
+
+## 5.7 Using RespPress v2
+
+*(placeholder — coming next)* Full runs against the localhost Redis: the knobs (connections, pipeline, rate, value size), real reports, first latency distributions — and the baseline that Part 7 will compare everything against.
 
 [↑ Go back to TOC](#table-of-contents)
 

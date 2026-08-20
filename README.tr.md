@@ -44,10 +44,14 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
   - [Deney 4.4 — event loop'u bloke etmek, ölçülmüş](#deney-44--event-loopu-bloke-etmek-ölçülmüş)
   - [Deney 4.5 — iki thread üstünde bir milyon bekleyen task](#deney-45--iki-thread-üstünde-bir-milyon-bekleyen-task)
   - [Deney 4.6 — quota altında async](#deney-46--quota-altında-async)
-- [Bölüm 5 — An experimental RESP load generator with tokio](#bölüm-5--an-experimental-resp-load-generator-with-tokio-devam-ediyor)
+- [Bölüm 5 — An experimental RESP load generator with tokio: RespPress](#bölüm-5--an-experimental-resp-load-generator-with-tokio-resppress-devam-ediyor)
   - [5.1 RESP protokolü — telin üstünde SET/GET](#51-resp-protokolü--telin-üstünde-setget)
   - [5.2 Redis kurulumu, elle RESP konuşmak](#52-redis-kurulumu-elle-resp-konuşmak)
   - [5.3 Ölçümün sözlüğü — latency, percentile'lar, histogramlar](#53-ölçümün-sözlüğü--latency-percentilelar-histogramlar)
+  - [5.4 RespPress tasarımımız — v1: Single-Thread PoC](#54-resppress-tasarımımız--v1-single-thread-poc)
+  - [5.5 RespPress v1 kullanımı](#55-resppress-v1-kullanımı)
+  - [5.6 RespPress tasarımımız — v2: Concurrent & Parallel](#56-resppress-tasarımımız--v2-concurrent--parallel)
+  - [5.7 RespPress v2 kullanımı](#57-resppress-v2-kullanımı)
 - [Bölüm 6 — Kubernetes requests & limits](#bölüm-6--kubernetes-requests--limits-yakında)
 - [Bölüm 7 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-7--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -59,7 +63,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 | 2 | [cgroup v2 elle](#bölüm-2--cgroup-v2-elle) | Kernel CPU zamanını nasıl dilimler, bunu nasıl canlı izlerim? | ✅ |
 | 3 | [Rust ile yük üreteci](#bölüm-3--rust-ile-yük-üreteci) | Thread sayısı, concurrency ve parallelism vCPU'larla nasıl etkileşir — tahminle değil ölçümle? | ✅ |
 | 4 | [Async Rust (tokio)](#bölüm-4--async-rust-tokio-ve-vcpu) | Async task'lar thread'lerin üstüne ne katar — worker pool, vCPU ve cgroup limitleriyle nasıl etkileşir? | ✅ |
-| 5 | [RESP yük üreteci](#bölüm-5--an-experimental-resp-load-generator-with-tokio-devam-ediyor) | Bölüm 4'ün dersleri gerçek bir alete dönüşebilir mi — sabit oranlı, latency ölçen bir Redis-protokolü client'ı? | ⏳ |
+| 5 | [RespPress (RESP yük üreteci)](#bölüm-5--an-experimental-resp-load-generator-with-tokio-resppress-devam-ediyor) | Bölüm 4'ün dersleri gerçek bir alete dönüşebilir mi — sabit oranlı, latency ölçen bir Redis-protokolü client'ı? | ⏳ |
 | 6 | [Kubernetes requests/limits](#bölüm-6--kubernetes-requests--limits-yakında) | `requests`/`limits` cgroup dosyalarına nasıl çevrilir, tüm sync/async iş yükleri bunların altında nasıl davranır? | 🔜 |
 | 7 | [Performans lab'ı (Redis & Dragonfly)](#bölüm-7--performans-labı-redis--dragonfly-boyutlandırma-yakında) | Zıt mimarili iki engine için *doğru* CPU kısıtları ne — VM'de ve OpenShift'te, ölçümle kanıtlı? | 🔜 |
 
@@ -1724,11 +1728,11 @@ $ ./target/release/05_ioload 100000
 
 [↑ Go back to TOC](#i̇çindekiler)
 
-# Bölüm 5 — An experimental RESP load generator with tokio *(devam ediyor)*
+# Bölüm 5 — An experimental RESP load generator with tokio: RespPress *(devam ediyor)*
 
-Bölüm 4 async dünyanın kurallarını öğretti; bu bölüm onları çalışan bir alete çeviriyor: Redis protokolü konuşan bir client — sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla. `redis` crate'i yok, kestirme yok: ham TCP ve elle kurulmuş protokol frame'leri — bu lab'ın "sihir yok" geleneğinde. Burada inşa edilen araç, Bölüm 7'nin boyutlandırma kampanyasının Tip-A silahıdır.
+Bölüm 4 async dünyanın kurallarını öğretti; bu bölüm onları çalışan bir alete çeviriyor — **RespPress**: Redis protokolü konuşan bir client — sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla. `redis` crate'i yok, kestirme yok: ham TCP ve elle kurulmuş protokol frame'leri — bu lab'ın "sihir yok" geleneğinde. Burada inşa edilen araç, Bölüm 7'nin boyutlandırma kampanyasının Tip-A silahıdır.
 
-Yol haritası: **5.1** telin üstünde RESP protokolü · **5.2** VM'e Redis kurulumu, elle RESP konuşmak · **5.3** ölçümün sözlüğü: latency, percentile'lar, histogramlar · **5.4** client iskeleti: bağlantılar, pipelining · **5.5** sabit oran ve tam rapor (§3.6'nın histogram borcu burada ödenir) · **5.6** localhost Redis'e karşı smoke test.
+Yol haritası: **5.1** telin üstünde RESP protokolü · **5.2** VM'e Redis kurulumu, elle RESP konuşmak · **5.3** ölçümün sözlüğü: latency, percentile'lar, histogramlar · **5.4** RespPress tasarımımız — v1 (tek bağlantı) · **5.5** RespPress v1 kullanımı · **5.6** RespPress tasarımımız — v2 (concurrent bağlantılar, sabit oran, tam rapor — §3.6'nın histogram borcu burada ödenir) · **5.7** RespPress v2 kullanımı.
 
 ## 5.1 RESP protokolü — telin üstünde SET/GET
 
@@ -1913,7 +1917,7 @@ Throttle'lı pod tam olarak iki tepeli türü üretir: isteklerin çoğu hızlı
 | Adım | Bağlantı | Ne öğretir |
 |---|---|---|
 | ilk sürüm (§5.4) | **1 bağlantı**, tek task | protokol + async IO temeli, sadeleştirilmiş dünyada |
-| son sürüm (§5.5) | **N concurrent bağlantı** — her bağlantı bir `tokio::spawn` task'ı | gerçek yük; Bölüm 4 bilgisinin sahaya inişi |
+| son sürüm (§5.6) | **N concurrent bağlantı** — her bağlantı bir `tokio::spawn` task'ı | gerçek yük; Bölüm 4 bilgisinin sahaya inişi |
 
 Nihai yük concurrent bağlantılardan basılır, çünkü tek bağlantı — pipeline'ı ne kadar derin olursa olsun — ne gerçek bir server'ı doyurur ne de gerçek client'ları modeller (dünya çok bağlantılıdır). Bağlantı sayısı ve pipeline derinliği CLI düğmeleridir: Bölüm 7'nin tarayacağı kadranlar arasındalar.
 
@@ -1925,7 +1929,21 @@ Nihai yük concurrent bağlantılardan basılır, çünkü tek bağlantı — pi
 - Dürüst şerh (§4.5'in dersi): uyanma muhasebesi de *CPU'dur*. Client'ı yeterince sıkıştırırsan — yüzbinlerce req/s + derin parse — worker'ları doyabilir. Çareler zaten politika: client **kısıtsız makinede** koşar (topoloji kuralı: ölçen asla aç kalmamalı) ve `worker_threads` yükseltilebilir.
 - Latency muhasebesi **coordinated-omission** ilkesine uyar: sabit-oran modunda her isteğin saati *planlanan* gönderim anında başlar, gerçekleşende değil — zorlanmış server'ın geriye ittiği client, o zorlanmayı rapordan saklamamalıdır. (Heartbeat'in `planned.elapsed()`'i tam bu ilkeydi.)
 
-*(5.4–5.6: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
+## 5.4 RespPress tasarımımız — v1: Single-Thread PoC
+
+*(placeholder — sırada)* İlk çalışan RespPress: tek bağlantı, tek task. Frame kodlayıcı (§5.1'in kuralları Rust fonksiyonuna dökülmüş), async TCP bağlantısı, SET/GET gidiş-dönüşleri, cevapların okunup doğrulanması. Kod: [`tokioburn/src/bin/06_resppress_v1.rs`](tokioburn/src/bin/06_resppress_v1.rs) — satır satır burada anlatılacak.
+
+## 5.5 RespPress v1 kullanımı
+
+*(placeholder — sırada)* v1'in localhost Redis'e karşı smoke testi: komutlar, gerçek çıktı ve sayıların ne söylediği (ve bilerek henüz söylemediği).
+
+## 5.6 RespPress tasarımımız — v2: Concurrent & Parallel
+
+*(placeholder — sırada)* Gerçek alet: N concurrent bağlantı (her biri bir task), pipeline derinliği, sabit istek oranı ve tam rapor — config echo, gerçekleşen oran, error'lar, veri hacmi, min/p50/p90/p99/p99.5/p99.9/max/avg, histogram. Coordinated-omission'a dayanıklı zamanlama. Kod: [`tokioburn/src/bin/07_resppress_v2.rs`](tokioburn/src/bin/07_resppress_v2.rs).
+
+## 5.7 RespPress v2 kullanımı
+
+*(placeholder — sırada)* Localhost Redis'e karşı tam koşular: düğmeler (bağlantı, pipeline, oran, value boyutu), gerçek raporlar, ilk latency dağılımları — ve Bölüm 7'nin her şeyi kıyaslayacağı baseline.
 
 [↑ Go back to TOC](#i̇çindekiler)
 
