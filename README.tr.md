@@ -47,6 +47,7 @@ Buradaki her deney gerçek bir makinede koşuldu (AWS EC2 `t3.large`, Ubuntu, cg
 - [Bölüm 5 — An experimental RESP load generator with tokio](#bölüm-5--an-experimental-resp-load-generator-with-tokio-devam-ediyor)
   - [5.1 RESP protokolü — telin üstünde SET/GET](#51-resp-protokolü--telin-üstünde-setget)
   - [5.2 Redis kurulumu, elle RESP konuşmak](#52-redis-kurulumu-elle-resp-konuşmak)
+  - [5.3 Ölçümün sözlüğü — latency, percentile'lar, histogramlar](#53-ölçümün-sözlüğü--latency-percentilelar-histogramlar)
 - [Bölüm 6 — Kubernetes requests & limits](#bölüm-6--kubernetes-requests--limits-yakında)
 - [Bölüm 7 — Performans lab'ı: Redis & Dragonfly boyutlandırma](#bölüm-7--performans-labı-redis--dragonfly-boyutlandırma-yakında)
 
@@ -1727,7 +1728,7 @@ $ ./target/release/05_ioload 100000
 
 Bölüm 4 async dünyanın kurallarını öğretti; bu bölüm onları çalışan bir alete çeviriyor: Redis protokolü konuşan bir client — sabit oranda pipeline'lı SET/GET, p50/p99 latency raporuyla. `redis` crate'i yok, kestirme yok: ham TCP ve elle kurulmuş protokol frame'leri — bu lab'ın "sihir yok" geleneğinde. Burada inşa edilen araç, Bölüm 7'nin boyutlandırma kampanyasının Tip-A silahıdır.
 
-Yol haritası: **5.1** telin üstünde RESP protokolü · **5.2** VM'e Redis kurulumu, elle RESP konuşmak · **5.3** client iskeleti: bağlantılar, pipelining, sabit oran · **5.4** p50/p99 ölçümü (§3.6'nın histogram borcu burada ödenir) · **5.5** localhost Redis'e karşı smoke test.
+Yol haritası: **5.1** telin üstünde RESP protokolü · **5.2** VM'e Redis kurulumu, elle RESP konuşmak · **5.3** ölçümün sözlüğü: latency, percentile'lar, histogramlar · **5.4** client iskeleti: bağlantılar, pipelining · **5.5** sabit oran ve tam rapor (§3.6'nın histogram borcu burada ödenir) · **5.6** localhost Redis'e karşı smoke test.
 
 ## 5.1 RESP protokolü — telin üstünde SET/GET
 
@@ -1852,7 +1853,60 @@ Cevap byte'larını §5.1'in tablosuyla karşılaştır — her birinin hesabı 
 
 O tek satırda iki şey oldu ve ikincisi çok önemli: **iki komutu, aralarında beklemeden, tek write'ta gönderdik — ve iki cevabı, sırasıyla, tek read'de aldık.** İşte pipelining *budur*; bayrak yok, açılacak özellik yok — §5.1'in söz verdiği gibi protokolün tasarımından kendiliğinden düştü. Birazdan yazacağımız client aynı şeyi yapacak; sadece N komut derinliğinde ve yanında kronometreyle.
 
-*(5.3–5.5: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
+## 5.3 Ölçümün sözlüğü — latency, percentile'lar, histogramlar
+
+Birazdan yazacağımız client `p50`, `p99.5`, `avg` gibi sayılar basacak. Tek satır kod yazmadan önce bu kelimelerin anlamını sabitle — çünkü yanlış okunan latency sayıları, production'da eksik sayılardan daha çok karar batırmıştır.
+
+### Latency vs throughput
+
+- **Latency**, *tek bir isteğin* deneyimidir: gönderilmesinden cevabının elde tutulmasına geçen süre. Birim: µs/ms.
+- **Throughput**, *bütün sistemin* hacmidir: saniyede tamamlanan istek. Birim: req/s.
+
+İlişkililer ama birbirinin yerine geçmezler ve concurrency altında birbirlerinin tersi **değildirler**: pipelining ile bir server saniyede 100.000 istek tamamlarken her tekil istek hâlâ 2 ms sürüyor olabilir. Bölüm 3–4 bunu başka kostümle öğretti: throughput burner'ların toplamıydı, latency heartbeat'in Δ'sıydı. Bir sistem birinde sağlıklı görünürken öbüründe ölüyor olabilir — §3.6'nın bütün derdi buydu.
+
+### Tek sayı yalandır: dağılım
+
+30 saniyelik koşu bir milyon istek tamamlar — bir milyon *farklı* latency. Onları özetleyen her tekil sayı bir şey saklar. Dürüst nesne **dağılımdır**: bir milyon değeri küçükten büyüğe diz, sıralı çizgiden konum oku. **Percentile** tam olarak budur: **pN = isteklerin %N'inin altında kaldığı değer.**
+
+```
+sıralı latency'ler →  [ ...isteklerin %50'si... | ...%40... | ...%9... | %1 ]
+                                            ↑p50        ↑p90      ↑p99   ↑max
+```
+
+### Karakter kadrosu
+
+| Metrik | Anlamı | Ne işe yarar |
+|---|---|---|
+| **p50 = median** | isteklerin yarısı bundan hızlıydı | "tipik istek" — p50 ile median aynı şeyin iki adı |
+| **avg (ortalama)** | toplam ÷ adet | tipik istek *değil* — uç değerler sürükler |
+| **p90** | 10 istekten 9'u bunu geçti | "epey kötü" durum |
+| **p99, p99.5, p99.9** | kuyruk | acının yaşadığı yer — aşağıda |
+| **min / max** | tekil en iyi / en kötü | max bu lab'ın eski dostu: worst-stall geleneği |
+
+**p50 vs avg — aynı veri, farklı hikâyeler.** 99 istek 1 ms + 1 istek 1000 ms: p50 = 1 ms (dürüst: tipik istek hızlı), avg ≈ 11 ms (yanıltıcı: hiçbir istek 11 ms sürmedi). Yine de ikisini de bas: **avg ile p50 arasındaki makas bir çarpıklık alarmıdır** — açıldığında kuyrukta canavar yaşıyordur.
+
+### Kuyruk (p99+) neden bu kadar önemli
+
+1. **Kullanıcı kuyruğa %1'in ima ettiğinden çok daha sık çarpar.** Bir sayfa yüklemesi ya da bir API işlemi, çok isteğe dağılır. Sayfa 100 istek atıyorsa en az birinin en kötü %1'e düşme olasılığı 1 − 0.99¹⁰⁰ ≈ **%63**. p99 nadir olay değildir; fan-out'lu sistemde *sayfaların çoğudur*.
+2. **SLO'lar kuyruk diliyle yazılır** — "isteklerin %99.9'u 50 ms altında" bir p99.9 iddiasıdır. Ciddi sözleşmelerde avg geçmez.
+3. **Mekanizmalar kuyrukta saklanır.** Bu lab'ın bütün hikâyesi p90'ın ötesinde yaşadı: CFS donması (§3.6), event-loop rehinesi (§4.4), uyanma fırtınası (§4.5) — hepsi p50 ve avg'de görünmez, hepsi p99.5'te çığlık atar. Kuyruğun ince adımları (p99 → p99.5 → p99.9), farklı mekanizmaların farklı derinliklerde yüzeye çıkmasındandır.
+
+### Histogram — bütün şekil, tek bakışta
+
+Percentile'lar dağılımın örnekleridir; **histogram** portresidir: latency'leri bucket'lara ayır (0.1–0.2 ms, 0.2–0.5 ms, … — bucket'lar gittikçe genişler; kuyruk detayı baş detayından kıymetlidir) ve her birinin nüfusunu göster. Percentile'ların gösteremediğini gösterir: **mod'ları**. Sağlıklı servis tek tepedir. İki tepe, iki rejim demektir:
+
+```
+tek tepe (sağlıklı):           iki tepe (iki rejim):
+  ▂▆█▆▂                          ▂▆█▆▂        ▂▅▂
+  hızlı───────yavaş              hızlı───────yavaş
+                                    ↑           ↑
+                                 normal      donma penceresine
+                                 istekler    denk gelen istekler
+```
+
+Throttle'lı pod tam olarak iki tepeli türü üretir: isteklerin çoğu hızlı, ayrı bir nüfus `cpu.max` donmalarının arkasında takılı. p50 "her şey yolunda" der; histogram ikinci toplumu gösterir. §3.6'nın söz verdiği ve Bölüm 7'nin avlayacağı resim işte bu.
+
+*(5.4–5.6: bekliyor — sonraki adımlarda inşa edilip ölçülecek.)*
 
 [↑ Go back to TOC](#i̇çindekiler)
 

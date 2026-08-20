@@ -47,6 +47,7 @@ Every experiment here was run on a real machine (AWS EC2 `t3.large`, Ubuntu, cgr
 - [Part 5 — An experimental RESP load generator with tokio](#part-5--an-experimental-resp-load-generator-with-tokio-in-progress)
   - [5.1 The RESP protocol — SET/GET on the wire](#51-the-resp-protocol--setget-on-the-wire)
   - [5.2 Installing Redis, speaking RESP by hand](#52-installing-redis-speaking-resp-by-hand)
+  - [5.3 The vocabulary of measurement — latency, percentiles, histograms](#53-the-vocabulary-of-measurement--latency-percentiles-histograms)
 - [Part 6 — Kubernetes requests & limits](#part-6--kubernetes-requests--limits-coming-soon)
 - [Part 7 — Performance lab: sizing Redis & Dragonfly](#part-7--performance-lab-sizing-redis--dragonfly-coming-soon)
 
@@ -1727,7 +1728,7 @@ $ ./target/release/05_ioload 100000
 
 Part 4 taught the rules of the async world; this part turns them into a working instrument: a client that speaks the Redis protocol — pipelined SET/GET at a fixed rate, reporting p50/p99 latency. No `redis` crate, no shortcuts: raw TCP and hand-built protocol frames, in this lab's tradition of no magic. The tool built here is the Type-A weapon of Part 7's sizing campaign.
 
-Roadmap: **5.1** the RESP protocol on the wire · **5.2** installing Redis on the VM, speaking RESP by hand · **5.3** the client skeleton: connections, pipelining, fixed rate · **5.4** p50/p99 measurement (the histogram debt from §3.6 is paid here) · **5.5** smoke test against a localhost Redis.
+Roadmap: **5.1** the RESP protocol on the wire · **5.2** installing Redis on the VM, speaking RESP by hand · **5.3** the vocabulary of measurement: latency, percentiles, histograms · **5.4** the client skeleton: connections, pipelining · **5.5** fixed rate and the full report (the histogram debt from §3.6 is paid here) · **5.6** smoke test against a localhost Redis.
 
 ## 5.1 The RESP protocol — SET/GET on the wire
 
@@ -1854,7 +1855,60 @@ Read the reply bytes against §5.1's table — every one accounted for:
 
 Two things happened in that one line, and the second one matters enormously: **we sent two commands in a single write without waiting between them — and got both replies back, in order, in a single read.** That *is* pipelining; no flag, no feature to enable — it fell out of the protocol's design, exactly as §5.1 promised. The client we build next does the same thing, just N commands deep and with a stopwatch attached.
 
-*(5.3–5.5: pending — built and measured in the next steps.)*
+## 5.3 The vocabulary of measurement — latency, percentiles, histograms
+
+The client we're about to build will print numbers like `p50`, `p99.5`, `avg`. Before writing a line of it, fix what those words mean — because misread latency numbers have sunk more production decisions than missing ones.
+
+### Latency vs throughput
+
+- **Latency** is the experience of *one request*: the time from sending it to holding its reply. Unit: µs/ms.
+- **Throughput** is the volume of *the whole system*: requests completed per second. Unit: req/s.
+
+They are related but not interchangeable, and under concurrency they are **not** reciprocals: with pipelining, a server may complete 100 000 req/s while each individual request still takes 2 ms. Parts 3–4 taught this in another costume: throughput measured the burners' totals; latency was the heartbeat's Δ. A system can look healthy in one and be dying in the other — that was §3.6's entire point.
+
+### One number is a lie: the distribution
+
+A 30-second run completes a million requests — a million *different* latencies. Any single number summarizing them hides something. The honest object is the **distribution**: sort all million values ascending, and read positions off the sorted line. A **percentile** is exactly that: **pN = the value below which N % of requests fell.**
+
+```
+sorted latencies →  [ ...50% of requests... | ...40%... | ...9%... | 1% ]
+                                        ↑p50        ↑p90      ↑p99   ↑max
+```
+
+### The cast of characters
+
+| Metric | Meaning | What it's good for |
+|---|---|---|
+| **p50 = median** | half the requests were faster than this | "the typical request" — p50 and median are two names for the same thing |
+| **avg (mean)** | sum ÷ count | *not* the typical request — outliers drag it |
+| **p90** | 9 of 10 requests beat this | the "pretty bad" case |
+| **p99, p99.5, p99.9** | the tail | where the pain lives — see below |
+| **min / max** | single best / single worst | max is this lab's old friend: the worst-stall tradition |
+
+**p50 vs avg — same data, different stories.** 99 requests at 1 ms + 1 request at 1000 ms: p50 = 1 ms (truthful: the typical request is fast), avg ≈ 11 ms (misleading: no request took 11 ms). Print both anyway: **the gap between avg and p50 is a skew alarm** — when it opens, monsters live in the tail.
+
+### Why the tail (p99+) matters so much
+
+1. **Users meet the tail far more often than 1 % suggests.** One page load or one API transaction fans out into many requests. If a page issues 100 requests, the chance at least one of them lands in the worst 1 % is 1 − 0.99¹⁰⁰ ≈ **63 %**. p99 is not a rare event; for a fan-out system it is *most page loads*.
+2. **SLOs are written in tail language** — "99.9 % of requests under 50 ms" is a p99.9 claim. avg does not appear in serious contracts.
+3. **The tail is where mechanisms hide.** This lab's whole story lives past p90: a CFS freeze (§3.6), an event-loop hostage (§4.4), a wake-up storm (§4.5) — all invisible in p50 and avg, all screaming in p99.5. The finer tail steps (p99 → p99.5 → p99.9) exist because different mechanisms surface at different depths.
+
+### The histogram — the whole shape at once
+
+Percentiles are samples of the distribution; the **histogram** is its portrait: bucket the latencies (0.1–0.2 ms, 0.2–0.5 ms, …, buckets widening as they go — tail detail matters more than head detail) and show the population of each. What it reveals that percentiles can't: **modes**. A healthy service is one hump. Two humps mean two regimes:
+
+```
+one hump (healthy):            two humps (two regimes):
+  ▂▆█▆▂                          ▂▆█▆▂        ▂▅▂
+  fast────────slow               fast────────slow
+                                    ↑           ↑
+                                 normal      requests that hit
+                                 requests    a freeze window
+```
+
+A throttled pod produces exactly the two-humped kind: most requests fast, a separate population stuck behind `cpu.max` freezes. p50 says "all fine"; the histogram shows the second society. That picture is what §3.6 promised and Part 7 will hunt for.
+
+*(5.4–5.6: pending — built and measured in the next steps.)*
 
 [↑ Go back to TOC](#table-of-contents)
 
