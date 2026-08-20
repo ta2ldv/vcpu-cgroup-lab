@@ -1,0 +1,38 @@
+Neden concurrent RespPress'te spawn seçiyoruz
+=============================================
+
+Karar kuralımızı hatırla (§4.2): "Bu kod çalışırken düzenli olarak .await'e uğruyor mu?"
+Bağlantı task'ının hayatına bak:
+
+    loop {
+        stream.write_all(&batch).await;   // gönder → network'ü BEKLE
+        stream.read(&mut buf).await;      // cevap → network'ü BEKLE
+        // aralarda µs'lik iş: frame kur, saat oku, histogram +1
+    }
+
+Ömrünün ~%99'u .await'te — ders kitabı IO-bound kodu. Kural: worker'lara → tokio::spawn.
+spawn_blocking ise .await EDEMEYEN kod içindi (burn, RocksDB); buradaki kod await'in ta kendisi.
+
+Yanlış eşleşmenin iki yönü de var:
+- await'siz işi tokio::spawn'a vermek → felaket (Deney 4.4: 4900 ms açlık)
+- await'li işi spawn_blocking'e sürmek → israf: 32 bağlantı = 32 OS thread; async'in bütün
+  ekonomisi (Deney 4.5: 3 thread'de 100k task) çöpe.
+
+tokio içindeki alternatifler:
+
+| Alternatif                                   | Nasıl                                  | Neden seçmedik |
+|----------------------------------------------|----------------------------------------|----------------|
+| tokio::spawn / bağlantı  ✓ SEÇİLDİ           | N task, worker havuzu taşır            | IO-bound'un doğal evi; ölçeklenir; kod basit |
+| spawn_blocking + sync std::net::TcpStream    | bağlantı başına gerçek thread          | çalışırdı! ama N thread maliyeti + Part 4 |
+|                                              | (klasik thread-per-connection)         | modelinin reddi; 1000 bağlantıya çıkamaz |
+| tek task içinde çok bağlantı                 | spawn'sız; tek task hepsini sırayla    | olur ama kod karmaşıklaşır ve work-stealing |
+| (join_all / select!)                         | await eder                             | devre dışı kalır; task/bağlantı hem sade hem dengeli |
+| current_thread runtime                       | tek worker'lı tokio                    | client'ı bilerek tek çekirdeğe kısıtlamak — |
+|                                              |                                        | "ölçen aç kalmasın" kuralına aykırı |
+
+İncelik: bağlantı task'ının içindeki küçük CPU kırıntıları (frame kurma, parse, histogram +1)
+kural ihlali değil — §4.2'deki "iki await arası 10-100 µs" sınırının rahat içindeler. Sorun
+UZUN KESİNTİSİZ CPU işiydi; mikrosaniyelik aralar worker paylaşımını bozmaz.
+
+Özet: seçim ideolojik değil, ölçtüğümüz mekaniğin sonucu —
+bekleyen iş worker'lara, beklemeyen iş blocking havuzuna; client baştan sona bekleyen iştir.
