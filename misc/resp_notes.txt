@@ -46,3 +46,32 @@ Araç komutları (lab'da işe yarayacaklar):
 olduğu için (["MSET","k1","v1",...] → frame) workload çeşitleri bedavaya gelir — Part 7'de
 "SET/GET karışımı" yanında "MSET batch yükü" ya da "HSET profil yükü" gibi desenler de
 taratılabilir. memtier de benzer desenleri destekler, çapraz doğrulama bozulmaz.
+
+────────────────────────────────────────────────────────────────────────
+
+redis-cli işletme komutları (lab'da kullandıklarımız):
+
+| Komut                                                  | İşi                                             |
+|--------------------------------------------------------|-------------------------------------------------|
+| redis-cli ping                                         | canlılık testi (PONG dönmeli)                   |
+| redis-cli DBSIZE                                       | kaç key var                                     |
+| redis-cli FLUSHALL                                     | tüm key'leri sil (data reset)                   |
+| redis-cli INFO stats | grep total_commands_processed   | işlenen toplam komut sayacı — ŞAHİTLİK:         |
+|                                                        | koşudan önce/sonra oku, fark = n olmalı         |
+|                                                        | (kümülatif! tek okuma anlamsız, fark al)        |
+| redis-cli CONFIG RESETSTAT                             | istatistik sayaçlarını sıfırla (data'ya         |
+|                                                        | dokunmaz; FLUSHALL'dan farkı bu)                |
+| redis-cli INFO stats                                   | tüm istatistikler (instantaneous_ops_per_sec    |
+|                                                        | = canlı ops/s — koşu sırasında izlemek için)    |
+| redis-cli SHUTDOWN NOSAVE                              | server'ı kapat (kopuş/negative testleri için;   |
+|                                                        | NOSAVE = diske dump alma)                       |
+| sudo systemctl start redis-server                      | server'ı geri başlat (SHUTDOWN temiz çıkıştır,  |
+|                                                        | systemd Restart=on-failure gereği otomatik      |
+|                                                        | diriltmez — elle start şart)                    |
+| redis-cli ping                                         | dirilme teyidi                                  |
+
+Şahitlik düzeni (ölçüm doğrulama ritüeli):
+    redis-cli CONFIG RESETSTAT
+    <koşu: resppress -n 5000000 ...>
+    redis-cli INFO stats | grep total_commands_processed
+    → beklenen: n + 1 (bizim istekler + INFO'nun kendisi; şahit kendini de sayar)

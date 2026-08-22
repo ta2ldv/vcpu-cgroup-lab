@@ -1,0 +1,49 @@
+RespPress — yapılacaklar (v2 ve sonrası)
+=========================================
+
+v2'nin birinci yarısı — CONCURRENCY (tek fark bu olacak ki v1↔v2 kıyası
+saf concurrency etkisini ölçsün):
+[ ] N concurrent bağlantı: bağlantı başına bir tokio::spawn task'ı
+    (gerekçe + alternatifler: misc/resppress_concurrent_notes.txt)
+[ ] --connections / -c flag'i
+[ ] task'lardan sonuç toplama (lats/oks/errors birleştirme)
+
+v2 SONRASI — WORKLOAD BOYUTLARI (v2'ye GİRMEYECEK; v2 yalnız concurrency/
+parallelism'dir. Bunlar RespPress kendi GitHub repo'suna taşındığında ele
+alınacak. Benchmark'ta olması gerekenler; v1 tek key 'foo' + 3B value +
+sabit 50/50 ile steril hücreydi):
+[ ] --keys N          key uzayı: key:{1..N} — sözlük büyümesi, memory
+                      maliyeti, gerçek RAM erişimi (tek key'de her şey CPU
+                      cache'inde oturur, server suni hızlı görünür)
+[ ] key dağılımı      uniform / zipfian (az sayıda sıcak key — gerçek trafik
+                      budur; Dragonfly'da shard dengesizliği ancak böyle
+                      görünür, Part 7 kıyası için önemli)
+[ ] --value-size B    64B / 1KB / 16KB — network hacmi + memory + kopyalama
+                      maliyeti (3 byte'lık "bar" hiçbir şeyi zorlamıyor)
+[ ] --ratio S:G       SET:GET oranı (1:9 read-heavy, 9:1 write-heavy...)
+[ ] --warmup S        ilk saniyeleri ölçüme DAHİL ETMEME (bağlantı ısınması
+                      vb. kirletmesin)
+[ ] --duration S      istek sayısı yerine süre bazlı koşu
+[ ] tekrar + varyans  aynı koşuyu 3× koşup min/median/max raporlama
+                      (tek koşu şans eseridir — 858k vs 955k oynamalarımız)
+[ ] dataset ön-yükleme  boş DB'ye değil dolu DB'ye (milyonlarca key) karşı
+                      ölçüm — gerçek çalışma noktası
+
+Ertelenmiş küçükler:
+[ ] latency birimi otomatik µs→ms (max ≥ 10000µs'te) — dinamik genişlik
+    çözüldü, birim okunabilirliği kaldı
+[ ] GET içerik doğrulaması (opsiyonel flag; parser geçerliliğe bakıyor,
+    değere bakmıyor)
+[ ] HSET/HMGET/INCR gibi komut desenleri (workload çeşitleri —
+    misc/resp_notes.txt'teki komut yüzeyi)
+[ ] p99.5 kolonu (rapor sözleşmesinde vardı, tabloya eklenmedi)
+
+NOT: RespPress İLERİDE KENDİ GITHUB REPO'SUNA taşınacak (Levent açacak);
+workload boyutları ve aşağıdaki ufuk oraya aittir. Lab'daki görevi:
+Part 7 kampanyasının Tip-A aleti olmak.
+
+İleri ufuk (RespPress repo'sunda / redis-dragonfly-test-repo ile birlikte):
+[ ] cgroup-aware benchmark fikri: koşu sırasında server'ın cpu.stat'ını
+    örnekleyip latency tepelerini throttle pencereleriyle zaman bazında
+    eşleştirmek ("bu p99.9 tepesinin %80'i CFS donmasına denk geldi") —
+    mevcut araçlarda olmayan katman-arası korelasyon

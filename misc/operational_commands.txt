@@ -1,0 +1,82 @@
+Disk doluluk teşhisi ve temizlik komutları (EC2/Ubuntu)
+========================================================
+
+Teşhis:
+    df -h /                                      # doluluk durumu
+    du -sh ~/tokioburn/target ~/resppress_v1/target   # asıl canavarlar muhtemelen bunlar (cargo derleme artıkları)
+
+Temizlik (en büyük geri kazanım cargo clean'lerden):
+    cd ~/tokioburn && cargo clean                # tokioburn'ün target'ını komple sil
+    cd ~/resppress_v1 && cargo clean             # (sonra tek build'le geri gelir)
+
+Ek süpürme gerekirse:
+    sudo apt clean                               # apt paket cache'i
+    sudo journalctl --vacuum-size=50M            # sistem loglarını 50 MB'a indir
+    du -sh ~/.cargo/registry                     # crate cache'i (gerekirse: rm -rf ~/.cargo/registry/cache)
+
+Suçluyu kökten bulma (yukarıdakiler yetmezse):
+    sudo du -xh / 2>/dev/null | sort -rh | head -20   # kökten en büyük 20 dizin/dosya
+    #  -x: başka filesystem'lere (örn. /proc, /sys) atlamaz
+    sudo du -xh /var 2>/dev/null | sort -rh | head -10  # klasik şüpheli: /var (log, cache, journal)
+    du -xh ~ 2>/dev/null | sort -rh | head -10          # home'daki en büyükler
+    sudo ls -lh /var/log/ | sort -k5 -rh | head         # tek tek büyük log dosyaları
+    journalctl --disk-usage                             # journal'ın toplam disk kullanımı
+    du -sh /var/cache/apt                               # apt cache boyutu
+
+Notlar:
+- redis DEĞİL: workload tek key kullanıyor (DBSIZE=1); RDB dump'ı da minik.
+- cargo target/ dizinleri proje başına yüzlerce MB - GB tutar; en sık suçlu.
+- ~/.cargo/registry paylaşımlı crate cache'idir; silinirse sonraki build yeniden indirir.
+
+Gerçek vaka (2026-08-22, t3.large 7.6G disk %100 dolu) — bulunan suçlular ve çareler:
+    rustup component remove rust-docs            # ~900 MB! rustup'ın offline HTML dokümanları —
+                                                 # derlemeyi etkilemez, en güvenli büyük kazanç
+    sudo apt clean                               # ~600 MB apt cache
+    # /var/lib/clickhouse (~1 GB): lab dışı kalıntı — veri kontrolü yapmadan silme!
+    # (gerekirse: sudo apt purge clickhouse-server clickhouse-common-static
+    #             && sudo rm -rf /var/lib/clickhouse)
+
+Ders: cargo target'ları temizken bile disk dolabilir; du -xh | sort -rh her zaman
+tahminden iyidir — bu vakada suçlu "dokümantasyon"du.
+
+ClickHouse tam söküm (karar verildi: lab dışı kalıntı, uçuruldu):
+    dpkg -l | grep -i clickhouse                 # önce ne kurulu gör
+    sudo systemctl stop clickhouse-server 2>/dev/null
+    sudo NEEDRESTART_MODE=a apt purge -y clickhouse-server clickhouse-common-static clickhouse-client
+    sudo apt autoremove -y                       # yetim kalan bağımlılıkları da at
+    sudo rm -rf /var/lib/clickhouse /etc/clickhouse-server /etc/clickhouse-client /var/log/clickhouse-server
+    df -h /                                      # kazancı gör (~1 GB beklenir)
+    # not: apt purge /var/lib/clickhouse'u silmeyebilir — veri dizini elle süpürülür
+
+Takılma vakası: "Unmet dependencies / apt --fix-broken install" (2026-08-22):
+  Sebep: disk %100 doluyken bir paket kurulumu (linux-headers) yarıda kalmış;
+  dpkg veritabanı yarım → apt, tamir edilmeden HİÇBİR kurulum/söküm yapmıyor.
+  Tamir de disk alanı istiyor → tavuk-yumurta. Çözüm sırası:
+    1) apt'siz alan aç:  rustup component remove rust-docs  +  sudo apt clean
+       (ikisi de bozuk apt durumundan etkilenmez)
+    2) sudo apt --fix-broken install     # yarım kalan paketi tamamlar
+    3) asıl işlem (purge vb.) artık geçer
+  Ders: disk dolu makinede apt işlemi yarıda kalabilir; önce alan, sonra tamir.
+
+journalctl kullanımı (boyut + içerik):
+    journalctl --disk-usage                  # journal'ın toplam disk kullanımı
+    du -sh /var/log/journal                  # aynı bilginin du hali
+    journalctl -e                            # son kayıtlara atla
+    journalctl -f                            # canlı takip (tail -f gibi)
+    journalctl -u redis-server               # tek servisin logları (SHUTDOWN/start izleri burada)
+    journalctl -p err -b                     # bu boot'taki yalnız error ve üstü
+    journalctl --since "1 hour ago"          # zaman filtresi
+    sudo journalctl --vacuum-size=50M        # 50 MB'a küçült
+    sudo journalctl --vacuum-time=7d         # 7 günden eskiyi at
+    sudo journalctl --rotate                 # aktif journal dosyasını arşive çevir
+    sudo journalctl --vacuum-time=1s         # (rotate sonrası) neredeyse her şeyi sil → KB'ler kalır
+    # not: vacuum yalnız ARŞİV dosyalarını siler; aktif dosya için önce --rotate şart
+
+SSH "broken pipe" (idle'da kopma) — sebep ve çare:
+  Sebep: NAT/firewall gibi ara kutular idle TCP bağlantısının durum kaydını
+  siler (tipik 5-15 dk); sonraki tuşta yol kalmamıştır → broken pipe.
+  Çare (client tarafı, ~/.ssh/config — Mac'te):
+      Host *
+          ServerAliveInterval 60     # 60 sn'de bir görünmez sağlık paketi
+          ServerAliveCountMax 3      # 3 cevapsız → kop
+  Uzun koşular için sigorta: tmux — SSH kopsa da oturum yaşar (tmux attach).

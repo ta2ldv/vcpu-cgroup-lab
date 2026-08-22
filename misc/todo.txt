@@ -1,0 +1,14 @@
+Öğrenilecekler (lab sırasında karşılaşılan, sonra derinleşilecek konular)
+=========================================================================
+
+[ ] /etc/systemd/journald.conf — journald'ın kalıcı yapılandırması:
+    - SystemMaxUse=50M        → journal'ın diskte kaplayabileceği toplam tavan
+    - SystemMaxFileSize=      → tek journal dosyası boyutu
+    - MaxRetentionSec=        → kayıt tutma süresi (zaman tavanı)
+    - Storage=persistent|volatile|none → nereye yazılsın (disk / sadece RAM / hiç)
+    Değişiklik sonrası: sudo systemctl restart systemd-journald
+    (vacuum = tek seferlik süpürge; journald.conf = kalıcı politika — fark bu.
+     Default davranış: journal disk boyutuna göre kendini sınırlar, ~%10 civarı.)
+
+[ ] journald genel mimarisi: binary log formatı, neden syslog'dan farklı,
+    journalctl'in filtre dili (-u, -p, --since) nereden güç alıyor.

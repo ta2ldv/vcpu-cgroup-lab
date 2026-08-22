@@ -1933,19 +1933,158 @@ The final load comes from concurrent connections, because one connection — how
 
 ## 5.4 Our RespPress design — v1: Single-Thread PoC
 
-*(placeholder — coming next)* The first working RespPress: one connection, one task. The frame encoder (§5.1's rules turned into a Rust function), an async TCP connection, SET/GET round-trips, replies read and verified. Code at [`tokioburn/src/bin/06_resppress_v1.rs`](tokioburn/src/bin/06_resppress_v1.rs), explained line by line here.
+RespPress v1 is a complete measuring instrument over **one connection**: it speaks raw RESP, pushes batched SET/GET load (optionally at a fixed rate), parses every reply, counts errors instead of dying on them, records per-request latency, and prints three framed tables. It lives in its own cargo project, [`resppress_v1/`](resppress_v1/) — the living code is [`src/main.rs`](resppress_v1/src/main.rs), and every construction step is preserved as a heavily-commented snapshot under [`src/bin/`](resppress_v1/src/bin/):
+
+| Step | What it added | Measured |
+|---|---|---|
+| [step01](resppress_v1/src/bin/step01.rs) | first contact: encode + connect + one SET/GET | `+OK`, `$3 bar` — the §5.2 bytes, from Rust |
+| [step02](resppress_v1/src/bin/step02.rs) | N requests, **ping-pong**, first req/s number | 18.6k req/s, 53.7 µs/req |
+| [step03](resppress_v1/src/bin/step03.rs) | **batching** + two fail-fast guards | 16k → **1.43M req/s** (77×) |
+| [step04](resppress_v1/src/bin/step04.rs) | **real RESP parser**, mixed workload, count-and-continue errors, read timeout | 1.48-1.54M — parser costs nothing |
+| [step05](resppress_v1/src/bin/step05.rs) | per-request **latency**, percentiles, framed tables & block histogram | the batch↔latency bargain (below) |
+| [step06](resppress_v1/src/bin/step06.rs) | CLI flags, **fixed rate + coordinated omission**, summary table, dynamic widths | the final instrument |
+
+### Ping-pong vs batching — where the 77× came from
+
+```
+ping-pong:            request1 →
+                               ← reply1     (wait: 1 RTT)
+                      request2 →
+                               ← reply2     (1 RTT again)
+             total time ≈ n × RTT — you pay a round trip per request
+
+batching:             request1 request2 ... requestB →   (concatenated, one write)
+                               ← reply1 reply2 ... replyB (in order, one read burst)
+             total time ≈ 1 RTT + processing — the round trip is SHARED by B requests
+```
+
+Ping-pong's ceiling is the wire, not the server: at 53.7 µs per localhost round trip, one connection tops out near 1/RTT ≈ 18.6k req/s while Redis naps. Batching is nothing but concatenation — RESP has no request IDs and answers strictly in order (§5.1), so "pipeline" = gluing B frames into one write and counting B replies. The measured bargain, with per-request latency (step05, 200k requests):
+
+| batch | req/s | p50 | p99 |
+|---|---|---|---|
+| 1 | 17k | 55 µs | 164 |
+| 10 | **145k (8.5×)** | 61 µs *(+6!)* | 203 |
+| 100 | 691k | 113 µs | 566 |
+| 1000 | 1.47M | **468 µs** | 962 |
+
+Batch 1→10 is the free-lunch zone (the RTT was being paid anyway); past ~100 the bargain sours — each request waits for its whole convoy. Practical guidance: **10–100 for latency-honest runs, up to ~1000 for throughput ceilings; beyond that, gains are crumbs and costs are real** — buffers fill, the server's output buffer bloats, and on a less forgiving server than Redis, a write-everything-then-read design can deadlock (both sides blocked writing). One warning from that family is measured fact here: latency semantics die as the batch grows.
+
+### The parser — from counting bytes to reading grammar
+
+Early versions counted reply bytes (every SET answer is `+OK\r\n` = 5 bytes) — a trick that collapses the moment replies vary. The real parser ([`parse_one`](resppress_v1/src/main.rs)) reads §5.1's grammar: first byte picks the type (`+ - : $ *`), simple types run to CRLF, bulk strings declare their length and are skipped in one hop, arrays recurse, `$-1` is a null (not an error). Two design points carry the weight:
+
+- **Partial frames.** TCP is a byte stream: a read may end mid-reply (`$3\r\nba` now, `r\r\n` later). `parse_one` returns `None` for "incomplete — read more"; the accumulated buffer *is* the parser's state.
+- **Count-and-continue.** An `-ERR` reply increments the `errors` counter (first sample kept for the report) and the run continues — a benchmark that hides or dies on errors lies. Fatal exits remain for what truly ends a run: connection closed (`read()==0`), 5 s read timeout, IO failure.
+
+Measured cost of all this grammar: none — the parser version ran *above* the byte-counting version's band (the workload also changed to 50/50 SET/GET, so the honest claim is "did not slow down", not "sped up").
+
+### Fixed rate and coordinated omission
+
+Unlimited mode ("as fast as possible") measures a ceiling; **fixed rate** measures behavior under a chosen load — the mode every comparison campaign needs. Batches get scheduled send times (`start + i × batch/rate`); the client sleeps until each slot, and — the crucial rule — **a request's latency clock starts at its *scheduled* time, not its actual send**. If the server falls behind, the backlog is *charged to latency* instead of hidden (the same `planned.elapsed()` principle as §4.2's heartbeat). This is coordinated-omission-safe timing, and it is what separates honest load generators from optimistic ones.
+
+### The CLI
+
+```
+usage: resppress_v1 [-n N] [-b B] [-r R] [-t HOST:PORT]
+  -n, --number      total requests       (default 10000)
+  -b, --batch-size  batch size           (default 1 = ping-pong)
+  -r, --rate        rate limit, req/s    (default 0 = unlimited)
+  -t, --target      target address       (default 127.0.0.1:6379;
+                    port omitted -> :6379 appended)
+```
+
+Hand-rolled parser (no crates — this lab's no-magic rule). Policies, all tested: unknown flag / malformed / missing value → `ERROR` + usage + exit 2; **duplicate flags are an error** even across spellings (`-n 1000 --number 2000` → `ERROR: duplicate flag: -n/--number was already given (conflicting values)`) — a typo must not silently run the wrong experiment; every knob left at its default is marked `(default)` in the report, so the output records *which dials were consciously set*.
+
+### Deliberate limits of v1
+
+One connection (concurrency is v2's *only* change — so the v1↔v2 comparison isolates it); one key (`DBSIZE`=1 — the dictionary and memory side of the server is never exercised); fixed 3-byte values and a fixed 50/50 mix; no warmup, single runs. In benchmark terms v1 has a complete *measuring* side and a skeletal *workload* side — the full gap list lives in [`misc/RespPress-todo.txt`](misc/RespPress-todo.txt).
 
 ## 5.5 Using RespPress v1
 
-*(placeholder — coming next)* The v1 smoke test against the localhost Redis: commands, real output, and what the numbers do (and deliberately do not yet) tell us.
+All commands used to run and verify v1, with real outputs (t3.large, localhost Redis).
+
+**A normal run** — summary (config echo, defaults marked), latency table, histogram:
+
+```
+$ cargo run --release -- -n 200000 -b 100 -r 20000
+PID: 17066
+Sending 200000 messages to 127.0.0.1:6379 ...
+summary:
+┌────────────┬─────────────────────┐
+│ target     │ 127.0.0.1 (default) │
+│ port       │ 6379 (default)      │
+│ workload   │ SET/GET mix 50/50   │
+│ requests   │ 200000              │
+│ batch size │ 100                 │
+│ rate       │ 20000 req/s         │
+│ duration   │ 10.00 s             │
+│ achieved   │ 20007 req/s         │
+│ replies    │ 200000 ok, 0 errors │
+└────────────┴─────────────────────┘
+latency:
+┌──────┬─────┬──────┬──────┬──────┬───────┬──────┬──────┐
+│ unit │ min │  p50 │  p90 │  p99 │ p99.9 │  max │  avg │
+├──────┼─────┼──────┼──────┼──────┼───────┼──────┼──────┤
+│   µs │ 166 │ 1240 │ 1650 │ 1826 │  2725 │ 7522 │ 1243 │
+└──────┴─────┴──────┴──────┴──────┴───────┴──────┴──────┘
+histogram:
+┌───────────┬────────────────────────────────────────────────────┬────────┐
+│ 100-200µs │ ▏                                                  │   0.1% │
+│  0.5-1ms  │ █████████████▊                                     │  27.6% │
+│   1-2ms   │ ████████████████████████████████████               │  71.9% │
+│   2-5ms   │ ▎                                                  │   0.4% │
+│  5-10ms   │ ▏                                                  │   0.1% │
+└───────────┴────────────────────────────────────────────────────┴────────┘
+```
+
+Note the pair `rate: 20000` / `achieved: 20007` and `duration 10.00 s` — 200k requests at 20k/s is exactly ten seconds: the calendar, not the server, set the pace.
+
+**The over-capacity run** — the coordinated-omission demonstration. Target 2M req/s, capacity ~880k:
+
+```
+$ cargo run --release -- -n 1000000 -b 100 -r 2000000
+summary:  ... rate 2000000 req/s │ duration 1.13 s │ achieved 881091 req/s ...
+latency:
+┌──────┬─────┬────────┬────────┬────────┬────────┬────────┬────────┐
+│ unit │ min │    p50 │    p90 │    p99 │  p99.9 │    max │    avg │
+├──────┼─────┼────────┼────────┼────────┼────────┼────────┼────────┤
+│   µs │ 183 │ 317950 │ 571037 │ 628566 │ 634402 │ 635006 │ 317918 │
+└──────┴─────┴────────┴────────┴────────┴────────┴────────┴────────┘
+histogram:   ...   │   >10ms   │ █████████████████████████████████████████████████▎ │  98.5% │
+```
+
+`achieved < target` plus a **half-second p50**: the schedule planned a million requests in 0.5 s, the server needed 1.13 s, and every request was billed from its *planned* birth — the backlog is in the table, not swept under it. This is the diagnostic signature of "offered load exceeds capacity", and most benchmarks cannot show it.
+
+**Verification rituals** (full command list in [`misc/resp_notes.txt`](misc/resp_notes.txt) and [`misc/operational_commands.txt`](misc/operational_commands.txt)):
+
+```bash
+# The witness: Redis's own command counter must match the client's claim
+redis-cli CONFIG RESETSTAT
+cargo run --release -- -n 5000000 -b 1000
+redis-cli INFO stats | grep total_commands_processed   # expect: 5000001 (+1 = INFO itself)
+
+# Negative tests — a good tool rejects bad input loudly:
+cargo run --release -- -x 5              # ERROR: unknown flag "-x" (+ usage)
+cargo run --release -- -n abc            # ERROR: -n needs a number, got "abc"
+cargo run --release -- -n                # ERROR: flag '-n' needs a value
+cargo run --release -- -n 1000 --number 2000   # ERROR: duplicate flag: -n/--number ...
+
+# Fault injection — the guards, live:
+#   mid-run `redis-cli SHUTDOWN NOSAVE` →
+#   ERROR: connection closed by server (round 3538, got 2640/5000 bytes)
+#   (and `sudo systemctl start redis-server` brings it back; a clean SHUTDOWN
+#    is not auto-restarted — systemd's Restart=on-failure only revives crashes)
+```
+
+The witness came back exact every time it was run — including one session where four 5M runs summed to `20000001` on the counter, to the request.
 
 ## 5.6 Our RespPress design — v2: Concurrent & Parallel
 
-*(placeholder — coming next)* The real instrument: N concurrent connections (one task each), pipeline depth, fixed request rate, and the full report — config echo, achieved rate, errors, data volume, min/p50/p90/p99/p99.5/p99.9/max/avg, histogram. Coordinated-omission-safe timing. Code at [`tokioburn/src/bin/07_resppress_v2.rs`](tokioburn/src/bin/07_resppress_v2.rs).
+*(placeholder — coming next)* v2 changes exactly **one** thing: **N concurrent connections**, one tokio task per connection (`-c/--connections`). Everything else — parser, batching, fixed rate, CO timing, the report — carries over untouched, so the v1↔v2 comparison isolates pure concurrency. Own project: `resppress_v2/`. (Workload dimensions — key space, value sizes, ratios — deliberately do NOT enter v2; they belong to RespPress's future standalone repo. See [`misc/RespPress-todo.txt`](misc/RespPress-todo.txt).)
 
 ## 5.7 Using RespPress v2
 
-*(placeholder — coming next)* Full runs against the localhost Redis: the knobs (connections, pipeline, rate, value size), real reports, first latency distributions — and the baseline that Part 7 will compare everything against.
+*(placeholder — coming next)* The concurrency sweep against the localhost Redis: same rate, `-c 1` vs `-c 8` vs `-c 32` — what N connections buy (and cost) with real reports; the baseline Part 7 will build on.
 
 [↑ Go back to TOC](#table-of-contents)
 

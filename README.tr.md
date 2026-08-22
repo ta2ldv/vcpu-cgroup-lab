@@ -1931,19 +1931,158 @@ Nihai yük concurrent bağlantılardan basılır, çünkü tek bağlantı — pi
 
 ## 5.4 RespPress tasarımımız — v1: Single-Thread PoC
 
-*(placeholder — sırada)* İlk çalışan RespPress: tek bağlantı, tek task. Frame kodlayıcı (§5.1'in kuralları Rust fonksiyonuna dökülmüş), async TCP bağlantısı, SET/GET gidiş-dönüşleri, cevapların okunup doğrulanması. Kod: [`tokioburn/src/bin/06_resppress_v1.rs`](tokioburn/src/bin/06_resppress_v1.rs) — satır satır burada anlatılacak.
+RespPress v1, **tek bağlantı** üstünde eksiksiz bir ölçüm cihazıdır: ham RESP konuşur, batch'li SET/GET yükü basar (istenirse sabit oranda), her cevabı parse eder, hatada ölmek yerine sayar, istek başına latency kaydeder ve üç çerçeveli tablo basar. Kendi cargo projesinde yaşar: [`resppress_v1/`](resppress_v1/) — yaşayan kod [`src/main.rs`](resppress_v1/src/main.rs), inşaatın her adımı da bol yorumlu snapshot olarak [`src/bin/`](resppress_v1/src/bin/) altında:
+
+| Adım | Ne ekledi | Ölçüm |
+|---|---|---|
+| [step01](resppress_v1/src/bin/step01.rs) | ilk temas: encode + bağlantı + bir SET/GET | `+OK`, `$3 bar` — §5.2'nin byte'ları, Rust'tan |
+| [step02](resppress_v1/src/bin/step02.rs) | N istek, **ping-pong**, ilk req/s sayısı | 18.6k req/s, 53.7 µs/istek |
+| [step03](resppress_v1/src/bin/step03.rs) | **batching** + iki fail-fast guard | 16k → **1.43M req/s** (77×) |
+| [step04](resppress_v1/src/bin/step04.rs) | **gerçek RESP parser**, karışık workload, say-ve-devam-et, read timeout | 1.48-1.54M — parser bedava |
+| [step05](resppress_v1/src/bin/step05.rs) | istek başına **latency**, percentile'lar, çerçeveli tablolar + bloklu histogram | batch↔latency pazarlığı (aşağıda) |
+| [step06](resppress_v1/src/bin/step06.rs) | CLI flag'leri, **sabit rate + coordinated omission**, summary tablosu, dinamik genişlik | nihai cihaz |
+
+### Ping-pong vs batching — 77× nereden geldi
+
+```
+ping-pong:            istek1 →
+                              ← cevap1     (bekleme: 1 RTT)
+                      istek2 →
+                              ← cevap2     (yine 1 RTT)
+             toplam süre ≈ n × RTT — her istek bir gidiş-dönüş öder
+
+batching:             istek1 istek2 ... istekB →   (yapıştırılmış, tek write)
+                              ← cevap1 cevap2 ... cevapB (sırayla, toplu okunur)
+             toplam süre ≈ 1 RTT + işleme — gidiş-dönüşü B istek PAYLAŞIR
+```
+
+Ping-pong'un tavanı server değil teldir: localhost gidiş-dönüşü 53.7 µs iken tek bağlantı 1/RTT ≈ 18.6k req/s'te takılır, Redis yatar. Batching ise yapıştırmadan ibarettir — RESP'te request ID yok ve cevaplar kesin sıralı (§5.1); "pipeline" = B frame'i tek write'a dizmek, B cevabı saymak. Ölçülmüş pazarlık, istek başına latency ile (step05, 200k istek):
+
+| batch | req/s | p50 | p99 |
+|---|---|---|---|
+| 1 | 17k | 55 µs | 164 |
+| 10 | **145k (8.5×)** | 61 µs *(+6!)* | 203 |
+| 100 | 691k | 113 µs | 566 |
+| 1000 | 1.47M | **468 µs** | 962 |
+
+1→10 bedava-öğle-yemeği bölgesi (RTT zaten ödeniyordu); ~100'den sonra pazarlık acılaşır — her istek koca konvoyunu bekler. Pratik rehber: **latency-dürüst koşular için 10–100; throughput tavanı için ~1000'e kadar; ötesi kırıntı kazanç, gerçek bedel** — tamponlar dolar, server'ın output buffer'ı şişer ve Redis kadar hoşgörülü olmayan bir server'da hepsini-yaz-sonra-oku tasarımı deadlock'a girebilir (iki taraf da yazmada bloklanır). O ailenin bir uyarısı burada ölçülmüş gerçek: batch büyüdükçe latency kavramı ölür.
+
+### Parser — byte saymaktan dilbilgisi okumaya
+
+İlk sürümler cevap byte'larını sayıyordu (her SET cevabı `+OK\r\n` = 5 byte) — cevaplar çeşitlenince çöken bir numara. Gerçek parser ([`parse_one`](resppress_v1/src/main.rs)) §5.1'in dilbilgisini okur: ilk byte türü seçer (`+ - : $ *`), basit türler CRLF'e koşar, bulk string uzunluğunu ilan eder ve tek hamlede atlanır, array özyineler, `$-1` null'dur (hata değil). İki tasarım noktası yükü taşır:
+
+- **Kısmi frame'ler.** TCP byte akışıdır: read cevabın ortasında bitebilir (`$3\r\nba` şimdi, `r\r\n` sonra). `parse_one` "eksik — daha oku" için `None` döner; biriken buffer, parser'ın durumunun ta kendisidir.
+- **Say-ve-devam-et.** `-ERR` cevabı `errors` sayacını artırır (ilk örnek rapora saklanır) ve koşu sürer — hatayı gizleyen ya da hatada ölen benchmark yalancıdır. Ölümcül çıkışlar gerçekten koşuyu bitiren şeylere saklıdır: bağlantı kapanması (`read()==0`), 5 sn read timeout, IO hatası.
+
+Bütün bu dilbilgisinin ölçülen maliyeti: yok — parser'lı sürüm, byte-sayan sürümün bandının *üstünde* koştu (workload da 50/50'ye değiştiği için dürüst iddia "yavaşlatmadı"dır, "hızlandırdı" değil).
+
+### Sabit rate ve coordinated omission
+
+Sınırsız mod ("elinden geldiğince") tavanı ölçer; **sabit rate** seçilmiş bir yük altındaki davranışı ölçer — her kıyas kampanyasının muhtaç olduğu mod. Batch'lere planlanan gönderim anları verilir (`start + i × batch/rate`); client her slota kadar uyur ve — kritik kural — **isteğin latency saati gerçek gönderimde değil, *planlanan* anda başlar**. Server geri kalırsa birikme *latency'ye yazılır*, gizlenmez (§4.2'deki heartbeat'in `planned.elapsed()` ilkesi). Coordinated-omission'a dayanıklı zamanlama budur — dürüst yük üretecini iyimserinden ayıran çizgi.
+
+### CLI
+
+```
+usage: resppress_v1 [-n N] [-b B] [-r R] [-t HOST:PORT]
+  -n, --number      total requests       (default 10000)
+  -b, --batch-size  batch size           (default 1 = ping-pong)
+  -r, --rate        rate limit, req/s    (default 0 = unlimited)
+  -t, --target      target address       (default 127.0.0.1:6379;
+                    port omitted -> :6379 appended)
+```
+
+Elle yazılmış parser (crate yok — lab'ın sihir-yok kuralı). Politikalar, hepsi test edilmiş: bilinmeyen flag / bozuk / eksik değer → `ERROR` + usage + exit 2; **duplicate flag hatadır**, yazımlar karışık olsa bile (`-n 1000 --number 2000` → `ERROR: duplicate flag: -n/--number was already given (conflicting values)`) — bir typo, yanlış deneyi sessizce koşturmamalı; default'ta kalan her düğme raporda `(default)` işaretlenir — çıktı, *hangi kadranların bilinçle çevrildiğini* de kayda geçirir.
+
+### v1'in bilinçli sınırları
+
+Tek bağlantı (concurrency, v2'nin *tek* değişikliği — böylece v1↔v2 kıyası onu izole eder); tek key (`DBSIZE`=1 — server'ın sözlük ve memory tarafı hiç yorulmaz); sabit 3 byte'lık value ve sabit 50/50 karışım; warmup yok, tek koşular. Benchmark diliyle: v1'in *ölçüm* tarafı tam, *iş yükü* tarafı iskelet — eksiklerin tam listesi [`misc/RespPress-todo.txt`](misc/RespPress-todo.txt)'te.
 
 ## 5.5 RespPress v1 kullanımı
 
-*(placeholder — sırada)* v1'in localhost Redis'e karşı smoke testi: komutlar, gerçek çıktı ve sayıların ne söylediği (ve bilerek henüz söylemediği).
+v1'i koşturmak ve doğrulamak için kullanılan tüm komutlar, gerçek çıktılarla (t3.large, localhost Redis).
+
+**Normal bir koşu** — summary (config echo, default işaretli), latency tablosu, histogram:
+
+```
+$ cargo run --release -- -n 200000 -b 100 -r 20000
+PID: 17066
+Sending 200000 messages to 127.0.0.1:6379 ...
+summary:
+┌────────────┬─────────────────────┐
+│ target     │ 127.0.0.1 (default) │
+│ port       │ 6379 (default)      │
+│ workload   │ SET/GET mix 50/50   │
+│ requests   │ 200000              │
+│ batch size │ 100                 │
+│ rate       │ 20000 req/s         │
+│ duration   │ 10.00 s             │
+│ achieved   │ 20007 req/s         │
+│ replies    │ 200000 ok, 0 errors │
+└────────────┴─────────────────────┘
+latency:
+┌──────┬─────┬──────┬──────┬──────┬───────┬──────┬──────┐
+│ unit │ min │  p50 │  p90 │  p99 │ p99.9 │  max │  avg │
+├──────┼─────┼──────┼──────┼──────┼───────┼──────┼──────┤
+│   µs │ 166 │ 1240 │ 1650 │ 1826 │  2725 │ 7522 │ 1243 │
+└──────┴─────┴──────┴──────┴──────┴───────┴──────┴──────┘
+histogram:
+┌───────────┬────────────────────────────────────────────────────┬────────┐
+│ 100-200µs │ ▏                                                  │   0.1% │
+│  0.5-1ms  │ █████████████▊                                     │  27.6% │
+│   1-2ms   │ ████████████████████████████████████               │  71.9% │
+│   2-5ms   │ ▎                                                  │   0.4% │
+│  5-10ms   │ ▏                                                  │   0.1% │
+└───────────┴────────────────────────────────────────────────────┴────────┘
+```
+
+`rate: 20000` / `achieved: 20007` çiftine ve `duration 10.00 s` satırına dikkat — 20k/s'te 200k istek tam on saniyedir: tempoyu server değil, takvim koydu.
+
+**Kapasite-üstü koşu** — coordinated omission gösterisi. Hedef 2M req/s, kapasite ~880k:
+
+```
+$ cargo run --release -- -n 1000000 -b 100 -r 2000000
+summary:  ... rate 2000000 req/s │ duration 1.13 s │ achieved 881091 req/s ...
+latency:
+┌──────┬─────┬────────┬────────┬────────┬────────┬────────┬────────┐
+│ unit │ min │    p50 │    p90 │    p99 │  p99.9 │    max │    avg │
+├──────┼─────┼────────┼────────┼────────┼────────┼────────┼────────┤
+│   µs │ 183 │ 317950 │ 571037 │ 628566 │ 634402 │ 635006 │ 317918 │
+└──────┴─────┴────────┴────────┴────────┴────────┴────────┴────────┘
+histogram:   ...   │   >10ms   │ █████████████████████████████████████████████████▎ │  98.5% │
+```
+
+`achieved < target` artı **yarım saniyelik p50**: takvim bir milyon isteği 0.5 saniyeye planladı, server 1.13 saniyede yetişti ve her istek *planlanan* doğum anından faturalandı — birikme tabloda, halının altında değil. "Sunulan yük kapasiteyi aşıyor"un teşhis imzası budur ve çoğu benchmark bunu gösteremez.
+
+**Doğrulama ritüelleri** (tam komut listesi: [`misc/resp_notes.txt`](misc/resp_notes.txt) ve [`misc/operational_commands.txt`](misc/operational_commands.txt)):
+
+```bash
+# Şahit: Redis'in kendi komut sayacı, client'ın iddiasıyla tutmalı
+redis-cli CONFIG RESETSTAT
+cargo run --release -- -n 5000000 -b 1000
+redis-cli INFO stats | grep total_commands_processed   # beklenen: 5000001 (+1 = INFO'nun kendisi)
+
+# Negative testler — iyi araç kötü girdiyi GÜRÜLTÜYLE reddeder:
+cargo run --release -- -x 5              # ERROR: unknown flag "-x" (+ usage)
+cargo run --release -- -n abc            # ERROR: -n needs a number, got "abc"
+cargo run --release -- -n                # ERROR: flag '-n' needs a value
+cargo run --release -- -n 1000 --number 2000   # ERROR: duplicate flag: -n/--number ...
+
+# Arıza enjeksiyonu — guard'lar, canlı:
+#   koşu ortasında `redis-cli SHUTDOWN NOSAVE` →
+#   ERROR: connection closed by server (round 3538, got 2640/5000 bytes)
+#   (geri getirme: `sudo systemctl start redis-server`; temiz SHUTDOWN
+#    otomatik dirilmez — systemd'nin Restart=on-failure'ı yalnız çökmeyi diriltir)
+```
+
+Şahit her koşusunda kuruşu kuruşuna tuttu — dört ayrı 5M koşusunun sayaçta `20000001` toplaması dahil.
 
 ## 5.6 RespPress tasarımımız — v2: Concurrent & Parallel
 
-*(placeholder — sırada)* Gerçek alet: N concurrent bağlantı (her biri bir task), pipeline derinliği, sabit istek oranı ve tam rapor — config echo, gerçekleşen oran, error'lar, veri hacmi, min/p50/p90/p99/p99.5/p99.9/max/avg, histogram. Coordinated-omission'a dayanıklı zamanlama. Kod: [`tokioburn/src/bin/07_resppress_v2.rs`](tokioburn/src/bin/07_resppress_v2.rs).
+*(placeholder — sırada)* v2 tam olarak **tek** şeyi değiştirir: **N concurrent bağlantı**, bağlantı başına bir tokio task (`-c/--connections`). Geri kalan her şey — parser, batching, sabit rate, CO zamanlaması, rapor — aynen taşınır; böylece v1↔v2 kıyası saf concurrency'yi izole eder. Kendi projesi: `resppress_v2/`. (Workload boyutları — key uzayı, value boyutları, oranlar — v2'ye bilerek GİRMEZ; onlar RespPress'in ileride açılacak bağımsız repo'suna aittir. Bkz. [`misc/RespPress-todo.txt`](misc/RespPress-todo.txt).)
 
 ## 5.7 RespPress v2 kullanımı
 
-*(placeholder — sırada)* Localhost Redis'e karşı tam koşular: düğmeler (bağlantı, pipeline, oran, value boyutu), gerçek raporlar, ilk latency dağılımları — ve Bölüm 7'nin her şeyi kıyaslayacağı baseline.
+*(placeholder — sırada)* Localhost Redis'e karşı concurrency taraması: aynı rate'te `-c 1` vs `-c 8` vs `-c 32` — N bağlantının kazandırdığı (ve maliyeti), gerçek raporlarla; Bölüm 7'nin üstüne kuracağı baseline.
 
 [↑ Go back to TOC](#i̇çindekiler)
 
